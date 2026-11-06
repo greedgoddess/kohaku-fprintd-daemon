@@ -1,5 +1,7 @@
 # Kohaku: fingerprint MCU dead after S3 resume, investigation notes
 
+> **Resolved for s2idle with MrChromebox-2609.3.** After updating from 2503.0, the FADT advertises S0ix (`Low Power S0 Idle (V5) : 1`) and Linux defaults to s2idle. In a 34-second test, `slp_s0_residency_usec` rose by 33.8 seconds (S0ix for practically the whole suspend). No `EC detected sleep transition timeout` appeared, and the FPMCU answered normally afterwards. A longer suspend was fine as well. Possibly relevant release notes: S0ix EC/CREC sleep-notification hooks (2606.0) and an infinite EC host-sleep timeout by default (2609.0). Deep sleep (S3) hasn't been re-tested on 2609.3. The notes below describe the original problem on 2503.0.
+
 **Summary.** On a Samsung Galaxy Chromebook (Kohaku) with MrChromebox UEFI firmware and Fedora, the fingerprint MCU (FPMCU) works from a cold boot. Through `/dev/cros_fp`, enrolment, matching and template save/restore all work with the daemon in this repository. After a **deep (S3) suspend**, the FPMCU never answers on SPI again until a **full power-off**. Toggling its reset and power-enable GPIOs from Linux doesn't bring it back, although the same toggles do restart it cleanly while it's healthy. With **s2idle** the FPMCU survives, but the machine wakes by itself after about 10 seconds without reaching S0ix.
 
 **Update:** upstream coreboot already documents that S3 resume doesn't work for the FPMCU on Kohaku (see [Firmware behaviour on S3 resume](#firmware-behaviour-on-s3-resume)). After S3, the firmware leaves the FPMCU's power and reset GPIOs low. Restoring them from Linux, even with a 15-second power-off and a re-initialised SPI controller, does not bring the FPMCU back.
@@ -119,7 +121,7 @@ There's no `_PR0`, `_PS0` or `_PS3`, and no GPIO resources, so the OS has no ACP
 
 `/proc/acpi/wakeup` lists: `LID0 S4 enabled`, `CREC S5 disabled`, `H020 S3 enabled (SYNA0000 touchpad)`, `CRFP S3 enabled`, `XHCI S4 enabled`, `CNVW S3 disabled`.
 
-## s2idle
+## s2idle (on 2503.0)
 
 With `echo s2idle > /sys/power/mem_sleep`:
 

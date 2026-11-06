@@ -14,11 +14,11 @@ The reader on ChromeOS devices is not a USB sensor that libfprint knows. It sits
 | GNOME login screen (after boot or logout) | ❌ Password only. GNOME Shell 51 uses fingerprint for re-authentication only, see [Login screen](#login-screen) |
 | polkit prompts, GNOME Settings > Fingerprint Login | Expected to work (same `fprintd` API), not yet tested |
 | Enrolled fingers survive reboots | ✅ Encrypted templates are saved and reloaded |
-| Reader after **suspend** | ⚠️ Stops working until a full power-off. See [Suspend](#suspend) |
+| Reader after **suspend** | ✅ With MrChromebox firmware 2609.3 (s2idle/S0ix). ⚠️ Not after deep sleep (S3), see [Suspend](#suspend) |
 
 Tested on one machine:
 
-- Samsung Galaxy Chromebook (Kohaku), MrChromebox UEFI firmware 2503.0
+- Samsung Galaxy Chromebook (Kohaku), MrChromebox UEFI firmware 2609.3 (earlier tests on 2503.0)
 - Fedora 45, GNOME Shell 51.1
 - FPMCU firmware `dartmonkey` (RO v2.0.2887, RW v2.0.28102), FPC sensor (model `0x140c`)
 
@@ -38,7 +38,7 @@ It's a single Python file (`cros-fprintd`) using PyGObject. It replaces the stoc
 
 - A Chromebook whose kernel log shows `CrOS Fingerprint MCU detected`, and where `/dev/cros_fp` exists.
 - Fedora (the installer uses `dnf`). Other distributions should work with the packages `fprintd`, `fprintd-pam` (or your distribution's `pam_fprintd`) and `python3-gobject`, installed by hand.
-- A reader that is alive. After a deep suspend it isn't, until the next full power-off (see below). Check with `tools/fpprobe` (`make && ./fpprobe7`) or simply `ls /dev/cros_fp` after a fresh boot.
+- A reader that is alive. After a deep (S3) suspend it isn't, until the next full power-off (see below). Check with `tools/fpprobe` (`make && ./fpprobe7`) or simply `ls /dev/cros_fp` after a fresh boot.
 
 ## Install
 
@@ -48,7 +48,7 @@ cd kohaku-fprintd-daemon
 sudo ./install.sh
 ```
 
-The installer copies the daemon to `/usr/local/libexec/cros-fprintd` and installs the systemd unit plus a stop-on-suspend drop-in. It masks the stock `fprintd.service` and starts the service.
+The installer copies the daemon to `/usr/local/libexec/cros-fprintd` and installs the systemd unit and a udev rule. It masks the stock `fprintd.service` and starts the service. Only if your default sleep mode is deep sleep (S3), it also installs a drop-in that stops the daemon before suspend (see [Suspend](#suspend)).
 
 The MCU accepts **one seed per boot**. If you have run the probe tools (`fpprobe3`) since the last boot, either reboot first, or pass the seed file they used: `sudo ./install.sh tools/fpprobe/seed.bin`. Without this, the daemon refuses to use a different seed, because fingers enrolled under the wrong seed couldn't be decrypted after the next boot.
 
@@ -89,13 +89,12 @@ So the lock screen asks the daemon about the reader, while the login screen neve
 
 ## Suspend
 
-On this machine the fingerprint MCU **stops responding after deep sleep (S3)**. Upstream coreboot documents this as a known limitation for Kohaku: the firmware's S3 resume path powers the fingerprint MCU off. It doesn't come back until a full power-off. Rebinding the driver, resetting it, or power-cycling it from software don't help. The details are in [docs/SUSPEND-INVESTIGATION.md](docs/SUSPEND-INVESTIGATION.md).
+**With MrChromebox firmware 2609.3, suspend works and the reader survives it.** That firmware advertises S0ix on Kohaku (the FADT's "Low Power S0 Idle" flag is set), so Linux uses s2idle by default (`cat /sys/power/mem_sleep` shows `[s2idle] deep`). In testing, the platform reached S0ix for the whole suspend, the EC no longer woke it after a few seconds, and the reader answered normally after waking, also after a longer suspend. If you're on older MrChromebox firmware, update it via the Firmware Utility Script.
 
-The installed drop-in (`systemd/stop-on-suspend.conf`) therefore stops the daemon before every suspend. After waking, nothing offers fingerprint login, so `sudo`, the lock screen and polkit go straight to the password. A full shutdown and boot brings fingerprint back.
+**Deep sleep (S3) still breaks the reader.** Upstream coreboot documents this as a known limitation for Kohaku: the firmware's S3 resume path powers the fingerprint MCU off, and it doesn't come back until a full power-off. Rebinding the driver, resetting it, or power-cycling it from software don't help. The details are in [docs/SUSPEND-INVESTIGATION.md](docs/SUSPEND-INVESTIGATION.md).
 
-- To get fingerprint back: shut down completely (not restart, not suspend), wait about 30 seconds, and boot.
-- To keep the daemon running across suspend anyway, for example if your machine behaves differently: `sudo rm /etc/systemd/system/cros-fprintd.service.d/stop-on-suspend.conf && sudo systemctl daemon-reload`. If the MCU then dies, the daemon reports an error within about a second, and PAM falls back to the password.
-- `s2idle` keeps the reader alive, but on this machine the laptop then wakes up by itself after about 10 seconds. It never reaches the processor's deep idle state, so it isn't a usable sleep mode. Leave `mem_sleep` at `deep`.
+- **If your default sleep mode is deep (S3),** for example on older firmware, the installer adds a drop-in (`systemd/stop-on-suspend.conf`) that stops the daemon before every suspend. After waking, `sudo`, the lock screen and polkit then go straight to the password, and a full shutdown brings fingerprint back.
+- **If your default is s2idle,** the installer leaves that drop-in out and removes it if an older install left it behind, so the daemon keeps running through suspend.
 
 ## Uninstall
 
@@ -112,7 +111,7 @@ This unmasks the stock `fprintd`. If you enabled it, turn off fingerprint in PAM
 |---|---|
 | `/usr/local/libexec/cros-fprintd` | the daemon |
 | `/etc/systemd/system/cros-fprintd.service` | systemd unit (`Type=dbus`, owns `net.reactivated.Fprint`) |
-| `/etc/systemd/system/cros-fprintd.service.d/stop-on-suspend.conf` | stops the daemon before sleep |
+| `/etc/systemd/system/cros-fprintd.service.d/stop-on-suspend.conf` | only when the default sleep mode is deep (S3): stops the daemon before sleep |
 | `/etc/udev/rules.d/70-cros-fprintd.rules` | starts the daemon once `/dev/cros_fp` appears during boot |
 | `/var/lib/cros-fprintd/seed` | 32-byte seed, mode 0600 |
 | `/var/lib/cros-fprintd/users/<user>/<finger>.bin` | encrypted templates (47,616 bytes each on this sensor), mode 0600 |
@@ -137,7 +136,7 @@ This unmasks the stock `fprintd`. If you enabled it, turn off fingerprint in PAM
 ## Troubleshooting
 
 - **`journalctl -u cros-fprintd -b`** is the first place to look.
-- **`MCU not ready yet`** at startup, or `ioctl ... Connection timed out` in the log, means the MCU isn't answering. This usually follows a suspend. Do a full power-off.
+- **`MCU not ready yet`** at startup, or `ioctl ... Connection timed out` in the log, means the MCU isn't answering. This usually follows a deep (S3) suspend. Do a full power-off, and check `cat /sys/power/mem_sleep` (s2idle should be selected).
 - **`cros-fprintd.service ... skipped, unmet condition check ConditionPathExists=/dev/cros_fp`** at boot: the reader appeared after systemd checked. The udev rule installed by `install.sh` starts the daemon when the device appears. Older installs: re-run `install.sh`.
 - **The lock screen doesn't offer fingerprint:** check that `gsettings get org.gnome.login-screen enable-fingerprint-authentication` prints `true` (see "Enable fingerprint in PAM" above), and log out and back in once. The lock screen only starts the fingerprint check once the password prompt is showing, so press a key first.
 - **`/dev/cros_fp` missing:** the kernel didn't detect the MCU at boot, or someone unbound the driver. A full power-off and boot normally restores it.
