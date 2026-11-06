@@ -89,7 +89,7 @@ So the lock screen asks the daemon about the reader, while the login screen neve
 
 ## Suspend
 
-On this machine the fingerprint MCU **stops responding after deep sleep (S3)**. It doesn't come back until a full power-off. Rebinding the driver, resetting it, or power-cycling it from software don't help. The details are in [docs/SUSPEND-INVESTIGATION.md](docs/SUSPEND-INVESTIGATION.md).
+On this machine the fingerprint MCU **stops responding after deep sleep (S3)**. Upstream coreboot documents this as a known limitation for Kohaku: the firmware's S3 resume path powers the fingerprint MCU off. It doesn't come back until a full power-off. Rebinding the driver, resetting it, or power-cycling it from software don't help. The details are in [docs/SUSPEND-INVESTIGATION.md](docs/SUSPEND-INVESTIGATION.md).
 
 The installed drop-in (`systemd/stop-on-suspend.conf`) therefore stops the daemon before every suspend. After waking, nothing offers fingerprint login, so `sudo`, the lock screen and polkit go straight to the password. A full shutdown and boot brings fingerprint back.
 
