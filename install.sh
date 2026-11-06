@@ -57,7 +57,14 @@ fi
 
 install -D -m 0755 "$HERE/cros-fprintd" "$BIN"
 install -D -m 0644 "$HERE/systemd/cros-fprintd.service" "$UNIT"
-install -D -m 0644 "$HERE/systemd/stop-on-suspend.conf" "$DROPIN_DIR/stop-on-suspend.conf"
+# Stop the daemon before suspend only where suspend means deep sleep (S3), which
+# leaves the fingerprint MCU unpowered on Kohaku. With s2idle/S0ix it survives.
+if grep -q '\[deep\]' /sys/power/mem_sleep 2>/dev/null; then
+    install -D -m 0644 "$HERE/systemd/stop-on-suspend.conf" "$DROPIN_DIR/stop-on-suspend.conf"
+    echo "default sleep mode is deep (S3): the daemon will stop itself before suspend"
+else
+    rm -f "$DROPIN_DIR/stop-on-suspend.conf"
+fi
 install -D -m 0644 "$HERE/udev/70-cros-fprintd.rules" "$UDEV_RULE"
 udevadm control --reload-rules
 
@@ -95,8 +102,8 @@ Installed. Next:
 GNOME's login screen (after boot or logout) only offers the password: GNOME
 Shell uses fingerprint for re-authentication (the lock screen) only. See README.
 
-Suspend: the reader stops working after deep sleep until a full power-off, so
-the daemon stops itself when the laptop suspends. Shut down fully to get
-fingerprint back.
+Suspend: with s2idle (the default on MrChromebox 2609.3 and later on Kohaku) the
+reader keeps working after suspend. With deep sleep (S3) it stops working until a
+full power-off, so in that case the daemon stops itself before suspend.
 Logs: journalctl -u cros-fprintd -b
 EOF
