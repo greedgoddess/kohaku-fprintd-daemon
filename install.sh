@@ -16,6 +16,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN=/usr/local/libexec/cros-fprintd
 UNIT=/etc/systemd/system/cros-fprintd.service
 DROPIN_DIR=/etc/systemd/system/cros-fprintd.service.d
+UDEV_RULE=/etc/udev/rules.d/70-cros-fprintd.rules
 STATE=/var/lib/cros-fprintd
 
 if [ "${1:-}" = "--uninstall" ]; then
@@ -23,6 +24,8 @@ if [ "${1:-}" = "--uninstall" ]; then
     systemctl unmask fprintd.service 2>/dev/null || true
     rm -f "$BIN" "$UNIT"
     rm -rf "$DROPIN_DIR"
+    rm -f "$UDEV_RULE"
+    udevadm control --reload-rules 2>/dev/null || true
     systemctl daemon-reload
     if [ "${2:-}" = "--purge" ]; then
         rm -rf "$STATE"
@@ -36,7 +39,7 @@ fi
 
 SEED_SRC="${1:-}"
 [ -e /dev/cros_fp ] || { echo "no /dev/cros_fp - is this a Chromebook with a fingerprint MCU (and was the reader alive at boot)?" >&2; exit 1; }
-for f in cros-fprintd systemd/cros-fprintd.service systemd/stop-on-suspend.conf; do
+for f in cros-fprintd systemd/cros-fprintd.service systemd/stop-on-suspend.conf udev/70-cros-fprintd.rules; do
     [ -f "$HERE/$f" ] || { echo "missing $HERE/$f" >&2; exit 1; }
 done
 
@@ -55,6 +58,8 @@ fi
 install -D -m 0755 "$HERE/cros-fprintd" "$BIN"
 install -D -m 0644 "$HERE/systemd/cros-fprintd.service" "$UNIT"
 install -D -m 0644 "$HERE/systemd/stop-on-suspend.conf" "$DROPIN_DIR/stop-on-suspend.conf"
+install -D -m 0644 "$HERE/udev/70-cros-fprintd.rules" "$UDEV_RULE"
+udevadm control --reload-rules
 
 # The stock fprintd would otherwise be started on demand and compete for the bus name.
 systemctl stop fprintd.service 2>/dev/null || true
@@ -66,20 +71,32 @@ sleep 1
 systemctl --no-pager --full status cros-fprintd.service || {
     echo; echo "service failed to start; see: journalctl -u cros-fprintd -b" >&2; exit 1; }
 
+if ! authselect current 2>/dev/null | grep -q with-fingerprint; then
+    cat <<'EOF'
+
+NOTE: fingerprint is not enabled in your PAM configuration yet. Without it,
+sudo, the lock screen and polkit won't offer fingerprint, and GNOME keeps
+"enable-fingerprint-authentication" switched off. Enable it with
+(keep a root shell open the first time you change PAM settings):
+    sudo authselect enable-feature with-fingerprint
+    sudo authselect apply-changes
+EOF
+fi
+
 cat <<'EOF'
 
 Installed. Next:
-  1. Enroll a finger:  GNOME Settings > System > Users > Fingerprint Login,
-                       or:  fprintd-enroll
+  1. Enroll a finger:  fprintd-enroll
   2. Test it:          fprintd-verify
-  3. Fingerprint for login, lock screen and sudo (password stays as fallback).
-     Check with `authselect current`; if "with-fingerprint" is not listed:
-       sudo authselect enable-feature with-fingerprint
-       sudo authselect apply-changes
-     Keep a root shell open the first time you change PAM settings.
+  3. Log out and back in once, so GNOME Shell picks up the reader.
+     Then sudo and the lock screen accept your fingerprint; the password
+     always remains as a fallback.
+
+GNOME's login screen (after boot or logout) only offers the password: GNOME
+Shell uses fingerprint for re-authentication (the lock screen) only. See README.
 
 Suspend: the reader stops working after deep sleep until a full power-off, so
-the daemon stops itself when the laptop suspends (see README). Shut down fully
-to get fingerprint back.
+the daemon stops itself when the laptop suspends. Shut down fully to get
+fingerprint back.
 Logs: journalctl -u cros-fprintd -b
 EOF

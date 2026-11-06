@@ -639,7 +639,14 @@ class Service:
             log.info("client %s vanished; releasing device", name)
             self.release()
 
+    def _who(self, sender):
+        try:
+            return f"{sender} (uid {self._caller_uid(sender)})"
+        except Exception:                             # noqa: BLE001
+            return sender
+
     def get_property(self, conn, sender, path, iface, prop):
+        log.debug("property %s read by %s", prop, sender)
         values = {
             "name": GLib.Variant("s", "ChromeOS fingerprint MCU"),
             "scan-type": GLib.Variant("s", "press"),
@@ -651,6 +658,8 @@ class Service:
 
     def device_call(self, conn, sender, path, iface, method, params, invocation):
         handler = getattr(self, "m_" + method, None)
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("call %s%s from %s", method, params.unpack(), self._who(sender))
         try:
             if method in ("VerifyStop", "EnrollStop"):
                 if self._stop(sender, invocation, "verify" if method == "VerifyStop" else "enroll"):
@@ -665,12 +674,17 @@ class Service:
             else:
                 invocation.return_value(result)
         except FprintError as e:
+            if e.name.endswith(("PermissionDenied", "ClaimDevice", "AlreadyInUse", "Internal")):
+                log.warning("refused %s from %s: %s (%s)", method, self._who(sender),
+                            e.name.rsplit(".", 1)[-1], e)
             invocation.return_dbus_error(e.name, str(e))
         except Exception as e:                        # noqa: BLE001
             log.exception("method %s failed", method)
             invocation.return_dbus_error(ERR + "Internal", str(e))
 
     def manager_call(self, conn, sender, path, iface, method, params, invocation):
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("call %s from %s", method, self._who(sender))
         if method == "GetDevices":
             invocation.return_value(GLib.Variant("(ao)", ([DEV_PATH],)))
         elif method == "GetDefaultDevice":
