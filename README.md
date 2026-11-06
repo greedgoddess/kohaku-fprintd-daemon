@@ -4,6 +4,21 @@ Fingerprint unlock for the **Samsung Galaxy Chromebook (Kohaku)** running Fedora
 
 The first part of this README is for installing and using it. The [Development](#development) part covers how it works, the tests and tools, and releases.
 
+## Read this first
+
+**This is experimental software, version 0.8.0. Use it with caution.**
+
+- **Built for one laptop.** It was made for, and tested on, exactly one machine: the author's Samsung Galaxy Chromebook (Kohaku) with MrChromebox firmware 2609.3, Fedora 45 and GNOME Shell 51. The installer refuses anything outside that configuration, and even within it, your machine may behave differently.
+- **Not regularly maintained.** This is a personal project, published in case it helps someone. There is no promise of updates, fixes or answers to issues and pull requests. Fedora, GNOME or firmware updates may break it at any time. You're welcome to fork it; it's MIT-licensed.
+- **It touches sensitive parts of the system.** The daemon runs as root and talks directly to the fingerprint chip. The installer replaces the stock `fprintd` service. Enabling fingerprint changes your PAM login configuration. Keep a root shell open the first time you change PAM settings, and keep your password: it always remains a fallback.
+- **It handles biometric data, and its security hasn't been audited.** Treat fingerprint unlock as a convenience, not as a security feature you rely on.
+
+## How this was made
+
+This project was built with heavy use of AI. The daemon, installer, probe tools, tests and documentation were written largely by an AI assistant (Claude, by Anthropic) in a long working conversation with the author. The author directed the work, made the decisions, and ran every hardware test on the actual laptop. The hardware findings in this repository (command versions, pin readings, suspend behaviour) come from those real tests, not from the AI's assumptions.
+
+The code has not been reviewed by an independent expert. Read it before you run it as root, especially `install.sh` and `cros-fprintd`.
+
 ## Supported configuration
 
 The installer checks all of these and refuses to install otherwise:
@@ -42,7 +57,7 @@ cd kohaku-fprintd-*/
 sudo ./install.sh
 ```
 
-Releases are tested versions. Cloning `main` gives you the current development state instead.
+Releases are the versions that were tested on the author's laptop. Cloning `main` gives you the current, possibly untested, development state instead.
 
 To only check whether your laptop qualifies, without installing anything: `sudo ./install.sh --check`.
 
@@ -143,11 +158,11 @@ So the lock screen asks the daemon about the reader, while the login screen neve
 The release tarball contains only the user-facing files: the daemon, installer, unit, udev rule, README, LICENSE and a `VERSION` file. Its file name stays `kohaku-fprintd.tar.gz` for every release, so the `releases/latest/download/` link in [Install](#install) always points at the newest one.
 
 ```bash
-git tag -a v1.0.0 -m "v1.0.0"
-git push origin v1.0.0
-scripts/make-release.sh v1.0.0        # writes dist/kohaku-fprintd.tar.gz and its .sha256
-gh release create v1.0.0 dist/kohaku-fprintd.tar.gz dist/kohaku-fprintd.tar.gz.sha256 \
-    --title "v1.0.0" --notes "What changed, and which firmware it was tested on"
+git tag -a v0.8.0 -m "v0.8.0"
+git push origin v0.8.0
+scripts/make-release.sh v0.8.0        # writes dist/kohaku-fprintd.tar.gz and its .sha256
+gh release create v0.8.0 dist/kohaku-fprintd.tar.gz dist/kohaku-fprintd.tar.gz.sha256 \
+    --title "v0.8.0" --notes "What changed, and which firmware it was tested on"
 ```
 
 Without the `gh` tool, create the release on GitHub (Releases → Draft a new release → choose the tag) and attach the two files from `dist/`.
