@@ -5,3 +5,4 @@ tools/fpprobe/fpprobe[0-9]
 seed.bin
 *.bin
 __pycache__/
+dist/

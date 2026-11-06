@@ -1,3 +1,10 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * Minimal re-declaration of the cros_ec character-device interface (the
+ * struct cros_ec_command layout and the CROS_EC_DEV_IOCXCMD ioctl number), as
+ * exposed by the Linux kernel's cros_ec chardev, for systems whose kernel
+ * headers don't ship <linux/cros_ec_dev.h>.
+ */
 #ifndef CROS_EC_COMPAT_H
 #define CROS_EC_COMPAT_H
 #include <stdint.h>

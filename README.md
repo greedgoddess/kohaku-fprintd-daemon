@@ -1,30 +1,96 @@
 # kohaku-fprintd-daemon
 
-A fingerprint service for the **Samsung Galaxy Chromebook (board: Kohaku)** running ordinary Linux. It speaks the standard `fprintd` D-Bus API, so the `fprintd-*` tools, `pam_fprintd` (`sudo`) and the GNOME lock screen can use the built-in reader without changes.
+Fingerprint unlock for the **Samsung Galaxy Chromebook (Kohaku)** running Fedora with MrChromebox firmware: `sudo`, the GNOME lock screen, and the `fprintd-*` tools use the built-in fingerprint reader. The daemon, **cros-fprintd**, speaks the standard `fprintd` D-Bus API and drives the ChromeOS fingerprint MCU directly through `/dev/cros_fp`.
 
-The reader on ChromeOS devices is not a USB sensor that libfprint knows. It sits behind a small fingerprint microcontroller (the "FPMCU"), which the kernel exposes as `/dev/cros_fp`. Enrolment and matching run on that chip. This daemon drives it directly over the ChromeOS EC protocol.
+The first part of this README is for installing and using it. The [Development](#development) part covers how it works, the tests and tools, and releases.
 
-## Status
+## Supported configuration
+
+The installer checks all of these and refuses to install otherwise:
+
+| Requirement | How to check |
+|---|---|
+| Samsung Galaxy Chromebook (Kohaku) with a working fingerprint reader | `ls /dev/cros_fp` |
+| MrChromebox UEFI firmware **2609.3 or newer** | `cat /sys/class/dmi/id/bios_version` |
+| Suspend-to-idle (s2idle) as the default sleep mode | `cat /sys/power/mem_sleep` shows `[s2idle]` |
+| Working S0ix | the installer verifies it, with a 20-second test suspend if needed |
+
+**Deep sleep (S3) is not supported.** On Kohaku, the firmware switches the fingerprint chip off when resuming from S3, and it only comes back after a full power-off.
+
+Other Chromebooks with a ChromeOS fingerprint chip may work, but only Kohaku has been tested.
+
+## What works
 
 | | |
 |---|---|
-| Enrol, verify, list fingers | ✅ Working (`fprintd-enroll`, `fprintd-verify`, `fprintd-list`) |
-| `sudo` via `pam_fprintd` | ✅ Working, password stays as fallback |
-| GNOME lock screen | ✅ Working (GNOME Shell 51) |
-| GNOME login screen (after boot or logout) | ❌ Password only. GNOME Shell 51 uses fingerprint for re-authentication only, see [Login screen](#login-screen) |
-| polkit prompts, GNOME Settings > Fingerprint Login | Expected to work (same `fprintd` API), not yet tested |
-| Enrolled fingers survive reboots | ✅ Encrypted templates are saved and reloaded |
-| Reader after **suspend** | ✅ With MrChromebox firmware 2609.3 (s2idle/S0ix). ⚠️ Not after deep sleep (S3), see [Suspend](#suspend) |
+| Enrol and verify fingers (`fprintd-enroll`, `fprintd-verify`) | ✅ |
+| `sudo` | ✅ |
+| GNOME lock screen | ✅ |
+| Fingerprint after suspend | ✅ |
+| Fingers kept across reboots | ✅ |
+| GNOME login screen (after boot or logout) | ❌ Password only. GNOME uses fingerprint only to re-authenticate an existing session |
+| polkit prompts, GNOME Settings > Fingerprint Login | Not yet tested |
 
-Tested on one machine:
+## Install
 
-- Samsung Galaxy Chromebook (Kohaku), MrChromebox UEFI firmware 2609.3 (earlier tests on 2503.0)
-- Fedora 45, GNOME Shell 51.1
-- FPMCU firmware `dartmonkey` (RO v2.0.2887, RW v2.0.28102), FPC sensor (model `0x140c`)
+Update your firmware first, if needed, with the [MrChromebox Firmware Utility Script](https://docs.mrchromebox.tech/docs/fwscript). Then download and run the latest release:
 
-Other Chromebooks with a `cros_fp` fingerprint MCU may work, but nothing else has been tested. The daemon has no Kohaku-specific code. Only the suspend findings are board-specific.
+```bash
+curl -LO https://github.com/greedgoddess/kohaku-fprintd-daemon/releases/latest/download/kohaku-fprintd.tar.gz
+tar -xzf kohaku-fprintd.tar.gz
+cd kohaku-fprintd-*/
+sudo ./install.sh
+```
 
-## How it works
+Releases are tested versions. Cloning `main` gives you the current development state instead.
+
+To only check whether your laptop qualifies, without installing anything: `sudo ./install.sh --check`.
+
+Turn on fingerprint in PAM if the installer says it's off. Keep a second root shell open while you do it:
+
+```bash
+sudo authselect enable-feature with-fingerprint
+sudo authselect apply-changes
+```
+
+Then enrol a finger, test it, and **log out and back in once**:
+
+```bash
+fprintd-enroll      # about a dozen touches; lift and move the finger slightly between touches
+fprintd-verify
+```
+
+Your password always keeps working as a fallback.
+
+## Uninstall
+
+```bash
+sudo ./install.sh --uninstall           # keeps your enrolled fingers
+sudo ./install.sh --uninstall --purge   # also deletes them
+```
+
+## Troubleshooting
+
+- **Logs:** `journalctl -u cros-fprintd -b`
+- **The installer reports a failed requirement:** each line says what's missing. The usual fix is a firmware update, or switching back to s2idle if you changed the sleep mode.
+- **The reader stopped working after a suspend:** check `cat /sys/power/mem_sleep`. If `deep` is selected, that's the unsupported S3 mode. A full power-off brings the reader back.
+- **The lock screen doesn't offer fingerprint:** check that `gsettings get org.gnome.login-screen enable-fingerprint-authentication` prints `true` (enabling `with-fingerprint` in PAM sets it), and log out and back in once. Press a key on the lock screen first, so the password field shows.
+
+## Security
+
+- **Fingerprint matching runs on the fingerprint chip itself.** Your fingerprint never leaves it unencrypted.
+- **The encrypted templates and the key material are root-only** under `/var/lib/cros-fprintd`. Anyone with root can read them, which is the same trust model as most Linux fingerprint setups.
+- **Treat it as a convenience unlock,** not a replacement for a strong password. Details are under [Security details](#security-details).
+
+## Development
+
+This part is for working on the code. Bug reports and contributions are welcome as GitHub issues and pull requests.
+
+### Support checks
+
+`install.sh` enforces the [supported configuration](#supported-configuration). It checks the firmware version, the FADT "Low Power S0 Idle" flag, the LPS0 ACPI device and the default sleep mode, and confirms that S0ix is actually reached, running a 20-second `rtcwake -m freeze` test suspend if S0ix hasn't been entered since boot. `sudo ./install.sh --check` runs the checks alone.
+
+### How it works
 
 - **Boot:** once per boot the MCU is given a 32-byte secret, the seed, stored root-only in `/var/lib/cros-fprintd/seed`. The MCU encrypts every template it hands out with a key derived from this seed.
 - **Per user:** each user gets a 32-byte id, `HMAC-SHA256(seed, "cros-fprintd user:" + username)`. Before every enrol or verify, the daemon sets that id as the MCU's user context, which wipes the templates the MCU holds, and then loads that user's saved templates.
@@ -34,47 +100,7 @@ Other Chromebooks with a `cros_fp` fingerprint MCU may work, but nothing else ha
 
 It's a single Python file (`cros-fprintd`) using PyGObject. It replaces the stock `fprintd`, which is masked during install. `pam_fprintd` and the client tools from Fedora's `fprintd` packages are still used.
 
-## Requirements
-
-- A Chromebook whose kernel log shows `CrOS Fingerprint MCU detected`, and where `/dev/cros_fp` exists.
-- Fedora (the installer uses `dnf`). Other distributions should work with the packages `fprintd`, `fprintd-pam` (or your distribution's `pam_fprintd`) and `python3-gobject`, installed by hand.
-- A reader that is alive. After a deep (S3) suspend it isn't, until the next full power-off (see below). Check with `tools/fpprobe` (`make && ./fpprobe7`) or simply `ls /dev/cros_fp` after a fresh boot.
-
-## Install
-
-```bash
-git clone https://github.com/greedgoddess/kohaku-fprintd-daemon.git
-cd kohaku-fprintd-daemon
-sudo ./install.sh
-```
-
-The installer copies the daemon to `/usr/local/libexec/cros-fprintd` and installs the systemd unit and a udev rule. It masks the stock `fprintd.service` and starts the service. Only if your default sleep mode is deep sleep (S3), it also installs a drop-in that stops the daemon before suspend (see [Suspend](#suspend)).
-
-The MCU accepts **one seed per boot**. If you have run the probe tools (`fpprobe3`) since the last boot, either reboot first, or pass the seed file they used: `sudo ./install.sh tools/fpprobe/seed.bin`. Without this, the daemon refuses to use a different seed, because fingers enrolled under the wrong seed couldn't be decrypted after the next boot.
-
-## Use
-
-```bash
-fprintd-enroll            # about a dozen touches; lift and move the finger slightly between touches
-fprintd-verify
-fprintd-list $USER
-```
-
-GNOME Settings > System > Users > Fingerprint Login should work too, but hasn't been tested yet.
-
-**Enable fingerprint in PAM (required).** On the test machine the `with-fingerprint` feature was not enabled, even though `fprintd-pam` was installed. Without it, `fingerprint-auth` doesn't contain `pam_fprintd`, and authselect keeps GNOME's `enable-fingerprint-authentication` setting switched off. Check with `authselect current`; if `with-fingerprint` isn't listed:
-
-```bash
-sudo authselect enable-feature with-fingerprint
-sudo authselect apply-changes
-gsettings get org.gnome.login-screen enable-fingerprint-authentication   # should now print true
-```
-
-Keep a root shell open the first time you change PAM settings. `pam_fprintd` is used as `sufficient`, so the password always remains as a fallback.
-
-**Then log out and back in once,** so GNOME Shell picks up the reader. After that, `sudo` and the lock screen accept your fingerprint.
-
-## Login screen
+### Login screen
 
 GNOME's login screen (after a boot or a logout) doesn't offer fingerprint, and that's GNOME's decision, not a fault in this daemon. In GNOME Shell 51, the login code (`gdm/authServicesLegacy.js` in `libshell-51.so`) only connects its fingerprint manager when it is re-authenticating an existing session:
 
@@ -87,37 +113,46 @@ _connectFingerprintManager() {
 
 So the lock screen asks the daemon about the reader, while the login screen never does, and there's no setting to change that. Log in with your password, then use the fingerprint for the lock screen and `sudo`.
 
-## Suspend
-
-**With MrChromebox firmware 2609.3, suspend works and the reader survives it.** That firmware advertises S0ix on Kohaku (the FADT's "Low Power S0 Idle" flag is set), so Linux uses s2idle by default (`cat /sys/power/mem_sleep` shows `[s2idle] deep`). In testing, the platform reached S0ix for the whole suspend, the EC no longer woke it after a few seconds, and the reader answered normally after waking, also after a longer suspend. If you're on older MrChromebox firmware, update it via the Firmware Utility Script.
-
-**Deep sleep (S3) still breaks the reader.** Upstream coreboot documents this as a known limitation for Kohaku: the firmware's S3 resume path powers the fingerprint MCU off, and it doesn't come back until a full power-off. Rebinding the driver, resetting it, or power-cycling it from software don't help. The details are in [docs/SUSPEND-INVESTIGATION.md](docs/SUSPEND-INVESTIGATION.md).
-
-- **If your default sleep mode is deep (S3),** for example on older firmware, the installer adds a drop-in (`systemd/stop-on-suspend.conf`) that stops the daemon before every suspend. After waking, `sudo`, the lock screen and polkit then go straight to the password, and a full shutdown brings fingerprint back.
-- **If your default is s2idle,** the installer leaves that drop-in out and removes it if an older install left it behind, so the daemon keeps running through suspend.
-
-## Uninstall
-
-```bash
-sudo ./install.sh --uninstall           # keeps /var/lib/cros-fprintd
-sudo ./install.sh --uninstall --purge   # also deletes the seed and enrolled templates
-```
-
-This unmasks the stock `fprintd`. If you enabled it, turn off fingerprint in PAM with `sudo authselect disable-feature with-fingerprint`.
-
-## Files and state
+### Repository layout
 
 | Path | What |
 |---|---|
-| `/usr/local/libexec/cros-fprintd` | the daemon |
-| `/etc/systemd/system/cros-fprintd.service` | systemd unit (`Type=dbus`, owns `net.reactivated.Fprint`) |
-| `/etc/systemd/system/cros-fprintd.service.d/stop-on-suspend.conf` | only when the default sleep mode is deep (S3): stops the daemon before sleep |
-| `/etc/udev/rules.d/70-cros-fprintd.rules` | starts the daemon once `/dev/cros_fp` appears during boot |
-| `/var/lib/cros-fprintd/seed` | 32-byte seed, mode 0600 |
-| `/var/lib/cros-fprintd/users/<user>/<finger>.bin` | encrypted templates (47,616 bytes each on this sensor), mode 0600 |
-| `/var/lib/cros-fprintd/users/<user>/fingers.json` | load order of the user's fingers |
+| `cros-fprintd` | the daemon (single Python file, PyGObject) |
+| `install.sh` | installer with the support checks (`--check`, `--uninstall`) |
+| `systemd/`, `udev/` | service unit, and the udev rule that starts the daemon when `/dev/cros_fp` appears |
+| `scripts/make-release.sh` | builds the release tarball |
+| `tests/` | D-Bus API tests against a simulated MCU |
+| `tools/fpprobe/` | small C programs used to work out the MCU protocol |
+| `docs/SUSPEND-INVESTIGATION.md` | the S3 investigation, and its resolution with firmware 2609.3 |
 
-## Security notes
+### Working on it
+
+- `tests/run-fake-tests.sh` runs the D-Bus API tests against a simulated MCU (`--fake-mcu`) on a private session bus, with no hardware or root needed.
+- `FPRINTD_CHECK_ROOT=/some/fake/root ./install.sh --check` runs the installer's checks against a fake `/sys` tree. That's useful for testing the support checks without the hardware.
+- With `-v`, the daemon logs every D-Bus request with the caller's uid. Refused requests are always logged as warnings. To turn it on for the installed service:
+
+  ```bash
+  printf '[Service]\nExecStart=\nExecStart=/usr/bin/python3 /usr/local/libexec/cros-fprintd -v\n' | sudo tee /etc/systemd/system/cros-fprintd.service.d/debug.conf
+  sudo systemctl daemon-reload && sudo systemctl restart cros-fprintd
+  ```
+
+- `tools/fpprobe/` contains probes for talking to the MCU by hand. See its README for which ones change the MCU's state.
+
+### Releasing
+
+The release tarball contains only the user-facing files: the daemon, installer, unit, udev rule, README, LICENSE and a `VERSION` file. Its file name stays `kohaku-fprintd.tar.gz` for every release, so the `releases/latest/download/` link in [Install](#install) always points at the newest one.
+
+```bash
+git tag -a v1.0.0 -m "v1.0.0"
+git push origin v1.0.0
+scripts/make-release.sh v1.0.0        # writes dist/kohaku-fprintd.tar.gz and its .sha256
+gh release create v1.0.0 dist/kohaku-fprintd.tar.gz dist/kohaku-fprintd.tar.gz.sha256 \
+    --title "v1.0.0" --notes "What changed, and which firmware it was tested on"
+```
+
+Without the `gh` tool, create the release on GitHub (Releases → Draft a new release → choose the tag) and attach the two files from `dist/`.
+
+### Security details
 
 - Matching happens on the MCU. Templates leave it only in encrypted form, and they're stored root-only.
 - The encryption is only as strong as the protection of `/var/lib/cros-fprintd/seed`. Anyone with root can read the seed and the templates. That's the same trust model as most Linux fingerprint setups.
@@ -125,7 +160,7 @@ This unmasks the stock `fprintd`. If you enabled it, turn off fingerprint in PAM
 - Treat fingerprint as a convenience unlock. It has only been tested with one enrolled finger against one other finger. False accept and false reject rates are unknown.
 - Instead of polkit, the access rule is "same user or root". Any local user can claim the reader for themselves, and can therefore block it for others while claimed, as with `fprintd`.
 
-## Known limitations
+### Known limitations
 
 - **Enrolment stages:** the daemon reports 12 stages to GNOME, which is an estimate. Enrolment took 10-11 images in testing, so GNOME's progress ring may jump at the end.
 - **Matching time:** the firmware rejects "match without template update". Matching time was seen to creep up slowly as templates are updated (about 130 to 180 ms). If matching gets noticeably slower over time, re-enrol the finger.
@@ -133,31 +168,7 @@ This unmasks the stock `fprintd`. If you enabled it, turn off fingerprint in PAM
 - **One user at a time:** the MCU has one user context, so the daemon reloads the right user's templates on every operation. Each verify starts by loading every saved finger, 93 transfers of 512 bytes per finger.
 - **No polkit integration,** as described above.
 
-## Troubleshooting
-
-- **`journalctl -u cros-fprintd -b`** is the first place to look.
-- **`MCU not ready yet`** at startup, or `ioctl ... Connection timed out` in the log, means the MCU isn't answering. This usually follows a deep (S3) suspend. Do a full power-off, and check `cat /sys/power/mem_sleep` (s2idle should be selected).
-- **`cros-fprintd.service ... skipped, unmet condition check ConditionPathExists=/dev/cros_fp`** at boot: the reader appeared after systemd checked. The udev rule installed by `install.sh` starts the daemon when the device appears. Older installs: re-run `install.sh`.
-- **The lock screen doesn't offer fingerprint:** check that `gsettings get org.gnome.login-screen enable-fingerprint-authentication` prints `true` (see "Enable fingerprint in PAM" above), and log out and back in once. The lock screen only starts the fingerprint check once the password prompt is showing, so press a key first.
-- **`/dev/cros_fp` missing:** the kernel didn't detect the MCU at boot, or someone unbound the driver. A full power-off and boot normally restores it.
-- **`enroll-failed` or `verify-unknown-error`:** check the log for the `ERROR` line.
-- **Low-level checks:** see [tools/fpprobe](tools/fpprobe/README.md).
-
-## Development
-
-- `tests/run-fake-tests.sh` runs the D-Bus API tests against a simulated MCU (`--fake-mcu`) on a private session bus, with no hardware or root needed. It covers enrol, verify with retry, claim and release, errors, and file permissions.
-- `cros-fprintd --session-bus --fake-mcu --state-dir /tmp/x -v` starts the daemon in the same mode by hand.
-- With `-v` the daemon logs every D-Bus request with the caller's uid, which is useful to see what a client asks. Refused requests are always logged as warnings. To turn it on for the installed service:
-
-  ```bash
-  printf '[Service]\nExecStart=\nExecStart=/usr/bin/python3 /usr/local/libexec/cros-fprintd -v\n' | sudo tee /etc/systemd/system/cros-fprintd.service.d/debug.conf
-  sudo systemctl daemon-reload && sudo systemctl restart cros-fprintd
-  ```
-
-  Remove `debug.conf` and reload to turn it off again.
-- `tools/fpprobe/` contains the small C programs used to work out the MCU protocol on real hardware.
-
-## Background
+### Background
 
 This was worked out step by step on real hardware using:
 
@@ -167,4 +178,4 @@ This was worked out step by step on real hardware using:
 
 ## License
 
-No license has been chosen yet. Until one is added, default copyright rules apply. If you want others to reuse or contribute, add a `LICENSE` file, for example MIT or GPL-2.0-or-later.
+[MIT](LICENSE). The ChromeOS EC command numbers and structure layouts the code relies on come from the ChromiumOS EC headers (BSD-3-Clause) and the Linux kernel's cros_ec interface. They are interface definitions, re-declared here, not copied code.

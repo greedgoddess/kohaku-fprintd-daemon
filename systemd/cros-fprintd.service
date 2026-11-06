@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 [Unit]
 Description=fprintd-compatible service for the ChromeOS fingerprint MCU
 ConditionPathExists=/dev/cros_fp

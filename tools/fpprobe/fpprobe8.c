@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /*
  * fpprobe8.c - read template 0 out of the FPMCU (encrypted) and save it to a file
  *

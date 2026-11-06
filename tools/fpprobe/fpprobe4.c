@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /*
  * fpprobe4.c - can this FPMCU start an enroll session in the plain seed flow?
  *

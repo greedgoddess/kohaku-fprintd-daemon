@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /*
  * fpprobe5.c - run a full enrollment, driven by MKBP fingerprint events
  *

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """D-Bus API test for cros-fprintd against its simulated MCU (--fake-mcu).
 
 Run via tests/run-fake-tests.sh; the argument is the daemon's state directory.
