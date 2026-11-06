@@ -1,0 +1,22 @@
+[Unit]
+Description=fprintd-compatible service for the ChromeOS fingerprint MCU
+ConditionPathExists=/dev/cros_fp
+After=dbus.service
+
+[Service]
+Type=dbus
+BusName=net.reactivated.Fprint
+ExecStart=/usr/bin/python3 /usr/local/libexec/cros-fprintd
+StateDirectory=cros-fprintd
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target

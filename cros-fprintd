@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+"""
+cros-fprintd - fprintd-compatible D-Bus service for ChromeOS fingerprint MCUs
+
+Speaks the net.reactivated.Fprint D-Bus API, so GNOME Settings, gdm, pam_fprintd
+(login, lock screen, sudo, polkit) and the fprintd-* tools work unchanged. The
+hardware side talks to the FPMCU through /dev/cros_fp (the cros_ec chardev).
+
+How it works (all of it proven with the fpprobe* programs):
+  * Once per boot the MCU is given a 32-byte secret (the "seed"), kept in
+    /var/lib/cros-fprintd/seed (root only).
+  * Each user gets a 32-byte id = HMAC-SHA256(seed, "cros-fprintd user:" + name).
+    Setting that id as the MCU's context wipes the templates in RAM, so before
+    every enroll/verify the daemon sets the context and loads the user's stored
+    templates (encrypted blobs in /var/lib/cros-fprintd/users/<user>/).
+  * Enrolling and matching run on the MCU; progress and results arrive as MKBP
+    fingerprint events read from /dev/cros_fp.
+  * Matching updates the template inside the MCU, so after a session the daemon
+    reads the templates back out and rewrites the files if the MCU says "dirty".
+
+Access rule (instead of polkit): a caller may act for a user if it runs as that
+user or as root. pam_fprintd under sudo/gdm runs as root; GNOME Settings runs as
+the user. Template files never leave the machine and are only readable by root.
+
+Dev options: --session-bus and --fake-mcu run the service without hardware or
+root, for trying the D-Bus side.
+"""
+import argparse
+import errno
+import fcntl
+import hashlib
+import hmac
+import json
+import logging
+import os
+import pwd
+import select
+import struct
+import sys
+import threading
+import time
+
+import gi
+
+gi.require_version("Gio", "2.0")
+gi.require_version("GLib", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+log = logging.getLogger("cros-fprintd")
+
+# ---------------------------------------------------------------- constants --
+CROS_EC_DEV_IOCXCMD = 0xC014EC00          # _IOWR(0xEC, 0, struct cros_ec_command)
+CROS_EC_DEV_IOCEVENTMASK = 0xEC02         # _IO(0xEC, 2), argument = event mask
+EC_MKBP_EVENT_FINGERPRINT = 5
+
+CMD_FP_MODE = 0x0402
+CMD_FP_INFO = 0x0403
+CMD_FP_FRAME = 0x0404
+CMD_FP_TEMPLATE = 0x0405
+CMD_FP_CONTEXT = 0x0406
+CMD_FP_SEED = 0x0408
+CMD_FP_ENC_STATUS = 0x0409
+
+MODE_IDLE = 0
+MODE_ENROLL = (1 << 4) | (1 << 5)         # ENROLL_SESSION | ENROLL_IMAGE
+MODE_MATCH = 1 << 6
+
+EV_ENROLL = 1 << 27
+EV_MATCH = 1 << 28
+
+SEED_STRUCT_VERSION = 4
+TEMPLATE_COMMIT = 0x80000000
+CHUNK = 512
+ENROLL_STAGES = 12                         # estimate; GNOME uses it for its progress ring
+
+BUS_NAME = "net.reactivated.Fprint"
+MGR_PATH = "/net/reactivated/Fprint/Manager"
+DEV_PATH = "/net/reactivated/Fprint/Device/0"
+MGR_IFACE = "net.reactivated.Fprint.Manager"
+DEV_IFACE = "net.reactivated.Fprint.Device"
+ERR = "net.reactivated.Fprint.Error."
+
+FINGERS = {
+    f"{side}-{name}"
+    for side in ("left", "right")
+    for name in ("thumb", "index-finger", "middle-finger", "ring-finger", "little-finger")
+}
+
+INTROSPECTION = f"""
+<node>
+  <interface name="{MGR_IFACE}">
+    <method name="GetDevices"><arg type="ao" direction="out"/></method>
+    <method name="GetDefaultDevice"><arg type="o" direction="out"/></method>
+  </interface>
+  <interface name="{DEV_IFACE}">
+    <method name="ListEnrolledFingers">
+      <arg type="s" direction="in"/><arg type="as" direction="out"/></method>
+    <method name="DeleteEnrolledFingers"><arg type="s" direction="in"/></method>
+    <method name="DeleteEnrolledFingers2"/>
+    <method name="Claim"><arg type="s" direction="in"/></method>
+    <method name="Release"/>
+    <method name="VerifyStart"><arg type="s" direction="in"/></method>
+    <method name="VerifyStop"/>
+    <method name="EnrollStart"><arg type="s" direction="in"/></method>
+    <method name="EnrollStop"/>
+    <signal name="VerifyFingerSelected"><arg type="s"/></signal>
+    <signal name="VerifyStatus"><arg type="s"/><arg type="b"/></signal>
+    <signal name="EnrollStatus"><arg type="s"/><arg type="b"/></signal>
+    <property name="name" type="s" access="read"/>
+    <property name="scan-type" type="s" access="read"/>
+    <property name="num-enroll-stages" type="i" access="read"/>
+    <property name="finger-present" type="b" access="read"/>
+    <property name="finger-needed" type="b" access="read"/>
+  </interface>
+</node>
+"""
+
+
+class FprintError(Exception):
+    """Error reported to the D-Bus caller as net.reactivated.Fprint.Error.<name>."""
+
+    def __init__(self, name, message):
+        super().__init__(message)
+        self.name = ERR + name
+
+
+class McuError(Exception):
+    pass
+
+
+# ----------------------------------------------------------------- hardware --
+class Mcu:
+    """The fingerprint MCU behind /dev/cros_fp."""
+
+    def __init__(self, path):
+        self.fd = os.open(path, os.O_RDWR)
+        self.lock = threading.Lock()
+        fcntl.ioctl(self.fd, CROS_EC_DEV_IOCEVENTMASK, 1 << EC_MKBP_EVENT_FINGERPRINT)
+        self._template_size = None
+
+    def xfer(self, cmd, ver=0, data=b"", insize=0):
+        n = max(len(data), insize)
+        buf = bytearray(struct.pack("<5I", ver, cmd, len(data), insize, 0) + data.ljust(n, b"\0"))
+        with self.lock:
+            try:
+                ret = fcntl.ioctl(self.fd, CROS_EC_DEV_IOCXCMD, buf, True)
+            except OSError as e:
+                raise McuError(f"ioctl for command 0x{cmd:04x} failed: {e}") from e
+        result = struct.unpack_from("<I", buf, 16)[0]
+        return result, bytes(buf[20:20 + max(ret, 0)])
+
+    def _ok(self, cmd, ver=0, data=b"", insize=0):
+        result, out = self.xfer(cmd, ver, data, insize)
+        if result != 0:
+            raise McuError(f"command 0x{cmd:04x} v{ver} returned EC result {result}")
+        return out
+
+    def enc_status(self):
+        out = self._ok(CMD_FP_ENC_STATUS, 0, b"", 8)
+        return struct.unpack("<II", out)[1]
+
+    def ensure_seed(self, seed, seed_is_new):
+        if self.enc_status() & 1:
+            if seed_is_new:
+                raise McuError(
+                    "the MCU already has a seed from another program this boot, but "
+                    "no seed file existed. Reboot (or install the seed that was used) "
+                    "so enrolled fingers stay decryptable after the next boot.")
+            return
+        self._ok(CMD_FP_SEED, 0, struct.pack("<HH", SEED_STRUCT_VERSION, 0) + seed)
+        log.info("seed set")
+
+    def set_context(self, userid):
+        """Set the user context. This clears all templates held by the MCU."""
+        self._ok(CMD_FP_CONTEXT, 1, struct.pack("<B3x", 0) + userid)
+        poll = struct.pack("<B3x", 1) + userid
+        for _ in range(100):
+            result, _ = self.xfer(CMD_FP_CONTEXT, 1, poll)
+            if result == 0:
+                return
+            time.sleep(0.1)
+        raise McuError("timed out waiting for the user context to be set")
+
+    def info(self):
+        b = self._ok(CMD_FP_INFO, 1, b"", 48)
+        if len(b) < 48:
+            raise McuError("short fp_info reply")
+        tsize, = struct.unpack_from("<I", b, 32)
+        tmax, tvalid = struct.unpack_from("<HH", b, 36)
+        dirty, = struct.unpack_from("<I", b, 40)
+        self._template_size = tsize
+        return {"template_size": tsize, "max": tmax, "valid": tvalid, "dirty": dirty}
+
+    def load_template(self, blob):
+        size = self.info()["template_size"]
+        if len(blob) != size:
+            raise McuError(f"stored template is {len(blob)} bytes, expected {size}")
+        for off in range(0, size, CHUNK):
+            part = blob[off:off + CHUNK]
+            last = off + len(part) == size
+            hdr = struct.pack("<II", off, len(part) | (TEMPLATE_COMMIT if last else 0))
+            self._ok(CMD_FP_TEMPLATE, 0, hdr + part)
+
+    def read_template(self, index):
+        size = self.info()["template_size"]
+        out = bytearray()
+        for off in range(0, size, CHUNK):
+            n = min(CHUNK, size - off)
+            part = self._ok(CMD_FP_FRAME, 0, struct.pack("<II", ((index + 1) << 28) | off, n), n)
+            if len(part) != n:
+                raise McuError("short template read")
+            out += part
+        return bytes(out)
+
+    def set_mode(self, mode):
+        self._ok(CMD_FP_MODE, 0, struct.pack("<I", mode), 4)
+
+    def drain_events(self):
+        while select.select([self.fd], [], [], 0)[0]:
+            os.read(self.fd, 64)
+
+    def wait_event(self, timeout):
+        """Return the next fingerprint event word, or None on timeout."""
+        if not select.select([self.fd], [], [], timeout)[0]:
+            return None
+        buf = os.read(self.fd, 64)
+        if len(buf) >= 5 and buf[0] == EC_MKBP_EVENT_FINGERPRINT:
+            return struct.unpack_from("<I", buf, 1)[0]
+        return None
+
+
+class FakeMcu:
+    """In-memory stand-in for development without hardware (--fake-mcu)."""
+
+    def __init__(self):
+        self.mode = 0
+        self.templates = []
+        self.dirty = 0
+        self.progress = 0
+        self.matches = 0
+        self.seed_set = False
+
+    def ensure_seed(self, seed, seed_is_new):
+        self.seed_set = True
+
+    def set_context(self, userid):
+        self.templates, self.dirty, self.progress = [], 0, 0
+
+    def info(self):
+        return {"template_size": 64, "max": 5, "valid": len(self.templates), "dirty": self.dirty}
+
+    def load_template(self, blob):
+        self.templates.append(blob)
+
+    def read_template(self, index):
+        self.dirty = 0
+        return (b"FAKE-TEMPLATE-%d-" % index + b"x" * 64)[:64]
+
+    def set_mode(self, mode):
+        self.mode = mode
+
+    def drain_events(self):
+        pass
+
+    def wait_event(self, timeout):
+        time.sleep(min(timeout, 0.15))
+        if self.mode & (1 << 5):                       # ENROLL_IMAGE armed
+            self.mode &= ~(1 << 5)
+            self.progress = min(100, self.progress + 9)
+            if self.progress >= 100:
+                self.templates.append(b"fake")
+                self.mode = 0
+                self.progress = 0
+                return EV_ENROLL | (100 << 4)
+            return EV_ENROLL | (self.progress << 4) | (2 if self.progress % 3 == 0 else 0)
+        if self.mode & (1 << 6):                       # MATCH armed
+            self.mode &= ~(1 << 6)
+            self.matches += 1
+            if self.matches % 2 == 1 or not self.templates:
+                return EV_MATCH | (0xF << 12)          # no match
+            self.dirty = 1
+            return EV_MATCH | 3                        # match, template updated, index 0
+        return None
+
+
+# ------------------------------------------------------------------ storage --
+def atomic_write(path, data):
+    tmp = f"{path}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    dfd = os.open(os.path.dirname(path), os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+class Store:
+    def __init__(self, root):
+        self.root = root
+        os.makedirs(os.path.join(root, "users"), mode=0o700, exist_ok=True)
+        os.chmod(root, 0o700)
+        seed_path = os.path.join(root, "seed")
+        self.seed_is_new = False
+        try:
+            with open(seed_path, "rb") as f:
+                self.seed = f.read()
+            if len(self.seed) != 32:
+                raise SystemExit(f"{seed_path} must be exactly 32 bytes")
+        except FileNotFoundError:
+            self.seed = os.urandom(32)
+            atomic_write(seed_path, self.seed)
+            self.seed_is_new = True
+            log.info("created new seed file %s", seed_path)
+
+    def userid(self, user):
+        return hmac.new(self.seed, b"cros-fprintd user:" + user.encode(), hashlib.sha256).digest()
+
+    def _dir(self, user):
+        if not user or "/" in user or user.startswith("."):
+            raise FprintError("Internal", "bad user name")
+        return os.path.join(self.root, "users", user)
+
+    def fingers(self, user):
+        """Enrolled finger names in MCU load order."""
+        d = self._dir(user)
+        try:
+            with open(os.path.join(d, "fingers.json")) as f:
+                order = json.load(f)["order"]
+        except (FileNotFoundError, ValueError, KeyError):
+            return []
+        return [x for x in order if x in FINGERS and os.path.exists(os.path.join(d, x + ".bin"))]
+
+    def read_finger(self, user, finger):
+        with open(os.path.join(self._dir(user), finger + ".bin"), "rb") as f:
+            return f.read()
+
+    def write_finger(self, user, finger, blob):
+        d = self._dir(user)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        atomic_write(os.path.join(d, finger + ".bin"), blob)
+
+    def set_order(self, user, order):
+        atomic_write(os.path.join(self._dir(user), "fingers.json"),
+                     json.dumps({"order": order}).encode())
+
+    def delete_all(self, user):
+        d = self._dir(user)
+        for finger in list(FINGERS):
+            try:
+                os.unlink(os.path.join(d, finger + ".bin"))
+            except FileNotFoundError:
+                pass
+        try:
+            os.unlink(os.path.join(d, "fingers.json"))
+        except FileNotFoundError:
+            pass
+
+
+# ------------------------------------------------------------------ service --
+class Session:
+    def __init__(self, kind):
+        self.kind = kind                      # "verify" or "enroll"
+        self.stop = threading.Event()         # asks the worker to end
+        self.finished = threading.Event()     # worker has ended
+        self.thread = None
+        self.waiters = []                     # pending VerifyStop/EnrollStop replies
+
+
+class Service:
+    def __init__(self, conn, mcu, store):
+        self.conn = conn
+        self.mcu = mcu
+        self.store = store
+        self.claimed_by = None
+        self.user = None
+        self.session = None
+        self.finger_needed = False
+
+    # -- helpers ----------------------------------------------------------
+    def _emit(self, signal, fmt, args):
+        def do():
+            self.conn.emit_signal(None, DEV_PATH, DEV_IFACE, signal, GLib.Variant(fmt, args))
+            return False
+        GLib.idle_add(do)
+
+    def _set_finger_needed(self, value):
+        def do():
+            self.finger_needed = value
+            self.conn.emit_signal(
+                None, DEV_PATH, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                GLib.Variant("(sa{sv}as)", (DEV_IFACE, {"finger-needed": GLib.Variant("b", value)}, [])))
+            return False
+        GLib.idle_add(do)
+
+    def _caller_uid(self, sender):
+        reply = self.conn.call_sync(
+            "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+            "GetConnectionUnixUser", GLib.Variant("(s)", (sender,)), GLib.VariantType("(u)"),
+            Gio.DBusCallFlags.NONE, -1, None)
+        return reply.unpack()[0]
+
+    def _resolve_user(self, sender, username):
+        """Return the user the call is for, enforcing: same user or root."""
+        uid = self._caller_uid(sender)
+        if not username:
+            try:
+                return pwd.getpwuid(uid).pw_name
+            except KeyError:
+                raise FprintError("PermissionDenied", "unknown calling user")
+        try:
+            target = pwd.getpwnam(username).pw_uid
+        except KeyError:
+            raise FprintError("PermissionDenied", f"unknown user {username!r}")
+        if uid != 0 and uid != target:
+            raise FprintError("PermissionDenied", "not allowed to act for another user")
+        return username
+
+    def _require_claim(self, sender):
+        if self.claimed_by is None or self.claimed_by != sender:
+            raise FprintError("ClaimDevice", "Device was not claimed before use")
+
+    # -- device methods ---------------------------------------------------
+    def m_ListEnrolledFingers(self, sender, args):
+        user = self._resolve_user(sender, args[0])
+        fingers = self.store.fingers(user)
+        if not fingers:
+            raise FprintError("NoEnrolledPrints", "Failed to discover prints")
+        return GLib.Variant("(as)", (fingers,))
+
+    def m_DeleteEnrolledFingers(self, sender, args):
+        user = self._resolve_user(sender, args[0])
+        self.store.delete_all(user)
+
+    def m_DeleteEnrolledFingers2(self, sender, args):
+        self._require_claim(sender)
+        self.store.delete_all(self.user)
+
+    def m_Claim(self, sender, args):
+        user = self._resolve_user(sender, args[0])
+        if self.claimed_by is not None:
+            raise FprintError("AlreadyInUse", "Device was already claimed")
+        self.claimed_by, self.user = sender, user
+        log.info("device claimed by %s for user %s", sender, user)
+
+    def m_Release(self, sender, args):
+        self._require_claim(sender)
+        self.release()
+
+    def release(self):
+        sess = self.session
+        if sess:
+            sess.stop.set()
+            if sess.thread:
+                sess.thread.join(timeout=10)
+            self.session = None
+        self.claimed_by = self.user = None
+
+    def _start(self, kind, target, finger):
+        if self.session is not None:
+            raise FprintError("AlreadyInUse", "Device is busy")
+        sess = Session(kind)
+        self.session = sess
+
+        def run():
+            try:
+                target(self.user, finger, sess.stop)
+            finally:
+                sess.finished.set()
+                GLib.idle_add(self._worker_finished, sess)
+
+        sess.thread = threading.Thread(target=run, name=kind, daemon=True)
+        # start after the method reply has been sent (see dispatch)
+        return sess
+
+    def _worker_finished(self, sess):
+        if self.session is sess and sess.waiters:
+            self.session = None
+            for inv in sess.waiters:
+                inv.return_value(None)
+            sess.waiters = []
+        return False
+
+    def _stop(self, sender, invocation, kind):
+        self._require_claim(sender)
+        sess = self.session
+        if sess is None or sess.kind != kind:
+            raise FprintError("NoActionInProgress", f"No {kind} in progress")
+        sess.stop.set()
+        if sess.finished.is_set():
+            self.session = None
+            return True
+        sess.waiters.append(invocation)
+        return False                         # reply sent later by _worker_finished
+
+    def m_VerifyStart(self, sender, args):
+        self._require_claim(sender)
+        finger = args[0] or "any"
+        if finger != "any" and finger not in FINGERS:
+            raise FprintError("InvalidFingername", "Invalid finger name")
+        if not self.store.fingers(self.user):
+            raise FprintError("NoEnrolledPrints", "No enrolled prints for user")
+        return self._start("verify", self._verify_worker, finger)
+
+    def m_EnrollStart(self, sender, args):
+        self._require_claim(sender)
+        finger = args[0]
+        if finger not in FINGERS:
+            raise FprintError("InvalidFingername", "Invalid finger name")
+        return self._start("enroll", self._enroll_worker, finger)
+
+    # -- MCU workflows (run in worker threads) -----------------------------
+    def _prepare_user(self, user, fingers):
+        """Seed + context + load the given fingers' templates. Returns the loaded names."""
+        self.mcu.ensure_seed(self.store.seed, self.store.seed_is_new)
+        self.store.seed_is_new = False
+        self.mcu.set_context(self.store.userid(user))
+        loaded = []
+        for f in fingers:
+            try:
+                self.mcu.load_template(self.store.read_finger(user, f))
+                loaded.append(f)
+            except (McuError, OSError) as e:
+                log.error("could not load %s for %s: %s", f, user, e)
+        return loaded
+
+    def _save_if_dirty(self, user, loaded):
+        try:
+            if loaded and self.mcu.info()["dirty"]:
+                for i, f in enumerate(loaded):
+                    self.store.write_finger(user, f, self.mcu.read_template(i))
+                log.info("saved updated templates for %s", user)
+        except (McuError, OSError) as e:
+            log.error("could not save updated templates for %s: %s", user, e)
+
+    def _verify_worker(self, user, finger, stop):
+        loaded = []
+        try:
+            loaded = self._prepare_user(user, self.store.fingers(user))
+            if not loaded:
+                self._emit("VerifyStatus", "(sb)", ("verify-unknown-error", True))
+                return
+            self.mcu.drain_events()
+            self.mcu.set_mode(MODE_MATCH)
+            self._emit("VerifyFingerSelected", "(s)", (finger,))
+            self._set_finger_needed(True)
+            while not stop.is_set():
+                ev = self.mcu.wait_event(0.25)
+                if ev is None or not ev & EV_MATCH:
+                    continue
+                err, idx = ev & 0xF, (ev >> 12) & 0xF
+                if err in (1, 3, 5):
+                    name = loaded[idx] if idx < len(loaded) else None
+                    ok = finger == "any" or name == finger
+                    log.info("match for %s: %s", user, name)
+                    self._emit("VerifyStatus", "(sb)", ("verify-match" if ok else "verify-no-match", True))
+                    return
+                if err == 0:
+                    self._emit("VerifyStatus", "(sb)", ("verify-no-match", True))
+                    return
+                if err in (2, 4):                     # low quality / low coverage
+                    self._emit("VerifyStatus", "(sb)", ("verify-retry-scan", False))
+                    self.mcu.set_mode(MODE_MATCH)
+                    continue
+                self._emit("VerifyStatus", "(sb)", ("verify-unknown-error", True))
+                return
+        except Exception as e:                        # noqa: BLE001 - report, don't crash
+            log.error("verify failed: %s", e)
+            self._emit("VerifyStatus", "(sb)", ("verify-unknown-error", True))
+        finally:
+            self._set_finger_needed(False)
+            try:
+                self.mcu.set_mode(MODE_IDLE)
+            except McuError as e:
+                log.error("could not set idle mode: %s", e)
+            self._save_if_dirty(user, loaded)
+
+    def _enroll_worker(self, user, finger, stop):
+        try:
+            others = [f for f in self.store.fingers(user) if f != finger]
+            loaded = self._prepare_user(user, others)
+            info = self.mcu.info()
+            if len(loaded) >= info["max"]:
+                self._emit("EnrollStatus", "(sb)", ("enroll-data-full", True))
+                return
+            index = len(loaded)
+            self.mcu.drain_events()
+            self.mcu.set_mode(MODE_ENROLL)
+            self._set_finger_needed(True)
+            last_event = time.monotonic()
+            while not stop.is_set():
+                ev = self.mcu.wait_event(0.25)
+                if ev is None:
+                    if time.monotonic() - last_event > 300:
+                        self._emit("EnrollStatus", "(sb)", ("enroll-failed", True))
+                        return
+                    continue
+                if not ev & EV_ENROLL:
+                    continue
+                last_event = time.monotonic()
+                err, progress = ev & 0xF, (ev >> 4) & 0xFF
+                if progress >= 100 and err in (0, 2):
+                    self.mcu.set_mode(MODE_IDLE)
+                    blob = self.mcu.read_template(index)
+                    self.store.write_finger(user, finger, blob)
+                    self.store.set_order(user, others + [finger])
+                    log.info("enrolled %s for %s", finger, user)
+                    self._emit("EnrollStatus", "(sb)", ("enroll-completed", True))
+                    return
+                if err in (0, 2):        # progress advanced (2 = finger did not move)
+                    self._emit("EnrollStatus", "(sb)", ("enroll-stage-passed", False))
+                elif err == 1:
+                    self._emit("EnrollStatus", "(sb)", ("enroll-retry-scan", False))
+                elif err == 3:
+                    self._emit("EnrollStatus", "(sb)", ("enroll-finger-not-centered", False))
+                else:
+                    self._emit("EnrollStatus", "(sb)", ("enroll-failed", True))
+                    return
+                self.mcu.set_mode(MODE_ENROLL)
+        except Exception as e:                        # noqa: BLE001
+            log.error("enroll failed: %s", e)
+            self._emit("EnrollStatus", "(sb)", ("enroll-failed", True))
+        finally:
+            self._set_finger_needed(False)
+            try:
+                self.mcu.set_mode(MODE_IDLE)
+            except McuError as e:
+                log.error("could not set idle mode: %s", e)
+
+    # -- D-Bus plumbing ---------------------------------------------------
+    def on_name_owner_changed(self, conn, sender, path, iface, signal, params):
+        name, _old, new = params.unpack()
+        if new == "" and name == self.claimed_by:
+            log.info("client %s vanished; releasing device", name)
+            self.release()
+
+    def get_property(self, conn, sender, path, iface, prop):
+        values = {
+            "name": GLib.Variant("s", "ChromeOS fingerprint MCU"),
+            "scan-type": GLib.Variant("s", "press"),
+            "num-enroll-stages": GLib.Variant("i", ENROLL_STAGES),
+            "finger-present": GLib.Variant("b", False),
+            "finger-needed": GLib.Variant("b", self.finger_needed),
+        }
+        return values.get(prop)
+
+    def device_call(self, conn, sender, path, iface, method, params, invocation):
+        handler = getattr(self, "m_" + method, None)
+        try:
+            if method in ("VerifyStop", "EnrollStop"):
+                if self._stop(sender, invocation, "verify" if method == "VerifyStop" else "enroll"):
+                    invocation.return_value(None)
+                return
+            if handler is None:
+                raise FprintError("Internal", f"unknown method {method}")
+            result = handler(sender, params.unpack())
+            if isinstance(result, Session):           # VerifyStart / EnrollStart
+                invocation.return_value(None)
+                result.thread.start()
+            else:
+                invocation.return_value(result)
+        except FprintError as e:
+            invocation.return_dbus_error(e.name, str(e))
+        except Exception as e:                        # noqa: BLE001
+            log.exception("method %s failed", method)
+            invocation.return_dbus_error(ERR + "Internal", str(e))
+
+    def manager_call(self, conn, sender, path, iface, method, params, invocation):
+        if method == "GetDevices":
+            invocation.return_value(GLib.Variant("(ao)", ([DEV_PATH],)))
+        elif method == "GetDefaultDevice":
+            invocation.return_value(GLib.Variant("(o)", (DEV_PATH,)))
+        else:
+            invocation.return_dbus_error(ERR + "Internal", f"unknown method {method}")
+
+
+# --------------------------------------------------------------------- main --
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
+    ap.add_argument("--device", default="/dev/cros_fp")
+    ap.add_argument("--state-dir", default="/var/lib/cros-fprintd")
+    ap.add_argument("--session-bus", action="store_true", help="dev: use the session bus")
+    ap.add_argument("--fake-mcu", action="store_true", help="dev: no hardware, simulated MCU")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(levelname)s %(message)s")
+
+    store = Store(args.state_dir)
+    try:
+        mcu = FakeMcu() if args.fake_mcu else Mcu(args.device)
+    except OSError as e:
+        log.error("cannot open %s: %s", args.device, e)
+        return 1
+    # Do not give up if the MCU is not answering right now (e.g. after suspend):
+    # stay on the bus, and retry whenever a client uses the device.
+    try:
+        mcu.ensure_seed(store.seed, store.seed_is_new)
+        store.seed_is_new = False
+    except McuError as e:
+        log.warning("MCU not ready yet (%s); will retry when the device is used", e)
+
+    node = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION)
+    mgr_info = node.lookup_interface(MGR_IFACE)
+    dev_info = node.lookup_interface(DEV_IFACE)
+    loop = GLib.MainLoop()
+
+    def on_bus(conn, name):
+        svc = Service(conn, mcu, store)
+        conn.register_object(MGR_PATH, mgr_info, svc.manager_call, None, None)
+        conn.register_object(DEV_PATH, dev_info, svc.device_call, svc.get_property, None)
+        conn.signal_subscribe("org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged",
+                              "/org/freedesktop/DBus", None, Gio.DBusSignalFlags.NONE,
+                              svc.on_name_owner_changed)
+
+    def on_acquired(conn, name):
+        log.info("acquired %s", name)
+
+    lost = []
+
+    def on_lost(conn, name):
+        log.error("lost or could not acquire %s (is the stock fprintd running?)", name)
+        lost.append(True)
+        loop.quit()
+
+    bus = Gio.BusType.SESSION if args.session_bus else Gio.BusType.SYSTEM
+    Gio.bus_own_name(bus, BUS_NAME, Gio.BusNameOwnerFlags.NONE, on_bus, on_acquired, on_lost)
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        pass
+    return 1 if lost else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
