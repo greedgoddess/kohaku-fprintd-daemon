@@ -1,0 +1,4 @@
+# Start cros-fprintd as soon as the fingerprint MCU's device node appears.
+# The MCU can finish booting after systemd has already evaluated the service's
+# ConditionPathExists=/dev/cros_fp, in which case the service would be skipped.
+KERNEL=="cros_fp", SUBSYSTEM=="misc", TAG+="systemd", ENV{SYSTEMD_WANTS}+="cros-fprintd.service"
