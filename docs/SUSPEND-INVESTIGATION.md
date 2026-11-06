@@ -2,6 +2,8 @@
 
 **Summary.** On a Samsung Galaxy Chromebook (Kohaku) with MrChromebox UEFI firmware and Fedora, the fingerprint MCU (FPMCU) works from a cold boot. Through `/dev/cros_fp`, enrolment, matching and template save/restore all work with the daemon in this repository. After a **deep (S3) suspend**, the FPMCU never answers on SPI again until a **full power-off**. Toggling its reset and power-enable GPIOs from Linux doesn't bring it back, although the same toggles do restart it cleanly while it's healthy. With **s2idle** the FPMCU survives, but the machine wakes by itself after about 10 seconds without reaching S0ix.
 
+**Update:** upstream coreboot already documents that S3 resume doesn't work for the FPMCU on Kohaku (see [Firmware behaviour on S3 resume](#firmware-behaviour-on-s3-resume)). After S3, the firmware leaves the FPMCU's power and reset GPIOs low. Restoring them from Linux, even with a 15-second power-off and a re-initialised SPI controller, does not bring the FPMCU back.
+
 Corrections and ideas are very welcome, especially from anyone with the Hatch/Kohaku schematic or knowledge of the MrChromebox S3 resume path for this board.
 
 ## Environment
@@ -60,6 +62,36 @@ On this kernel's numbering:
 
 **Conclusion so far:** a reset or power cycle restarts a healthy FPMCU fine, but neither helps after S3. Whatever S3 breaks seems to be outside the FPMCU's own reset and power domain, and outside the Linux driver.
 
+## Firmware behaviour on S3 resume
+
+The coreboot change that introduced the current FPMCU power/reset handling for the Hatch family, [CL 37459 "hatch: Fix FPMCU pwr/rst gpio handling"](https://review.coreboot.org/c/coreboot/+/37459), describes the sequence as:
+
+1. no GPIO control in bootblock,
+2. disable power and assert reset in ramstage GPIO configuration,
+3. power on and then deassert reset at the end of ramstage,
+4. disable power and assert reset when entering S5.
+
+Its commit message also states that S3 resume will still not work properly, because step 2 forces the FPMCU's power off. In the list of scenarios validated on a Kohaku, "entering and leaving S3" is marked as not working, while S0ix isn't. ChromeOS presumably avoids this by using S0ix.
+
+What the pins show on this machine (`gpiochip0`, lines verified as above; `gpioget --as-is` reads without changing direction):
+
+| Line | Pad | Fresh boot | After S3 resume |
+|---|---|---|---|
+| 12 | GPP_A12, `FPMCU_RST_ODL` | `active` (reset released) | `inactive` (reset asserted) |
+| 267 | GPP_C11, `EN_FP_RAILS` | `active` (powered) | `inactive` (unpowered) |
+| 22 | GPP_A22, FPMCU BOOT0 | | `inactive` (normal boot) |
+
+So the firmware's S3 path leaves the FPMCU unpowered and in reset, consistent with step 2 running without step 3.
+
+Recovery attempts after S3, all of which failed (the FPMCU never answered, and a fresh `cros-ec-spi` probe ended with `Failed to continue RWSIG: -110` and `cannot register EC`):
+
+- **Restore power and reset:** the pads are not locked. `gpioset` changed lines 267 and 12 to `active`, and they read back as such.
+- **Clean power-up:** with BOOT0 held low, reset held, power off for 1 s and then for 15 s, power on, release reset.
+- **Fresh SPI controller:** unbind and rebind of the LPSS SPI controller (`0000:00:1e.3`, driver `intel-lpss`) after the power-up. The re-probe of the controller printed a kernel warning trace (`pxa2xx_spi_probe` → `intel_lpss_probe`).
+- **No visible GPIO changes:** `gpioinfo --chip gpiochip0` before and after S3 is identical. Directions, flags and consumers are the same; output values and pin-mux modes aren't shown by `gpioinfo`.
+
+The same power and reset toggles restart a healthy FPMCU within 5 seconds. So after S3 something else is missing that a GPIO power-up plus a controller re-init doesn't restore, most likely on the host side of the SPI link (for example the GSPI1 pad mux), or a sleep input the FPMCU watches.
+
 ## Other observations after a failed S3 resume
 
 - **Main EC sleep lines:** `gpioget` shows `"EC:SLP_S0_L"=active "EC:SLP_S3_L"=active "EC:SLP_S4_L"=active`, which I read as the EC seeing the host fully awake.
@@ -100,17 +132,17 @@ Unverified hypothesis: the EC's sleep-failure watchdog wakes the host because SL
 
 ## Hypotheses
 
-1. **Host-side SPI path:** something on the host side of the FPMCU's SPI link (SPI1 controller state, or the CS/CLK/MISO/MOSI pad configuration) isn't restored by the firmware's S3 resume path. The FPMCU might then be fine, but unreachable.
-2. **Sleep input stuck:** a sleep signal the FPMCU watches (`SLP_L` / `SLP_ALT_L`) stays asserted after S3 resume, so the FPMCU, even after a reset, stays in or returns to low power and ignores SPI.
-3. **Firmware difference:** something in ChromeOS's S3 resume (stock coreboot plus depthcharge) handles the FPMCU that the MrChromebox build doesn't.
+1. **Firmware S3 path (confirmed in part):** the resume path powers the FPMCU off and holds it in reset (coreboot CL 37459, and the pin readings above), and it never powers it back up.
+2. **Host-side SPI path:** on top of that, something on the host side of the FPMCU's SPI link (most likely the GSPI1 pad configuration: CS on GPP_A11 in native mode, plus clock and data pins) isn't restored by the S3 resume path. Re-powering the FPMCU and re-initialising the SPI controller from Linux don't fix this, and Linux can't safely re-mux those pads itself.
+3. **Sleep input stuck:** a sleep signal the FPMCU watches (`SLP_L` / `SLP_ALT_L`) stays asserted after S3 resume, so even a freshly powered FPMCU goes straight back to low power. The main EC reports `SLP_S0_L`/`SLP_S3_L`/`SLP_S4_L` as `active` after resume, which argues against this, but the FPMCU's own inputs can't be read while it's silent.
 
-The FPMCU surviving s2idle and dying in S3, and the fact that a GPIO power cycle doesn't revive it, point away from the FPMCU firmware itself.
+The FPMCU surviving s2idle and dying in S3, and coreboot documenting S3 as broken for it on Kohaku, both point at the firmware's S3 path rather than the FPMCU firmware or the Linux driver.
 
 ## Questions
 
+- Could the MrChromebox build re-run the FPMCU power-up (step 3: `GPP_C11` high, about 1 ms delay, `GPP_A12` high) on S3 resume? Does it restore the GSPI1 pads on resume?
 - Does the FPMCU work after S3 resume on Kohaku with stock ChromeOS firmware running Linux (for example via RW_LEGACY)?
-- Which PCH pads carry the FPMCU's SPI1 signals and `SLP_L` on Kohaku, and does coreboot reprogram them on S3 resume?
-- Is anyone getting S0ix on Kohaku under Linux with MrChromebox firmware?
+- Is anyone getting S0ix on Kohaku under Linux with MrChromebox firmware? With S0ix, the FPMCU would presumably not be powered down at all.
 
 ## Reproducing
 
