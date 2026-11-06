@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /*
  * fpprobe6.c - try matching against the template currently held in the MCU
  *

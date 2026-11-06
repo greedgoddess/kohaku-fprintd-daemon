@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /*
  * fpprobe7.c - read-only: transfer limits, FP command versions, template state
  *

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /*
  * fpprobe3.c - set the FPMCU encryption seed and user context, then check status
  *

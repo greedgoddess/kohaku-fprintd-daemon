@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /*
  * fpprobe2.c - read-only probe of the ChromeOS fingerprint MCU (FPMCU)
  *

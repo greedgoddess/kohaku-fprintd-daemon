@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 # Build all fingerprint MCU probe programs:  make
 CC ?= gcc
 CFLAGS ?= -O2 -Wall -Wextra

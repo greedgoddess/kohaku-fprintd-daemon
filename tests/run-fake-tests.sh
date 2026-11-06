@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # Run the D-Bus API tests against a simulated MCU on a private session bus.
 # No hardware and no root needed.  Usage:  tests/run-fake-tests.sh
 set -u

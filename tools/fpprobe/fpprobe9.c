@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /*
  * fpprobe9.c - load a saved encrypted template (template0.bin) back into the FPMCU
  *
