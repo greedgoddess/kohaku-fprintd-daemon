@@ -1,0 +1,7 @@
+# built probe binaries
+tools/fpprobe/fpprobe
+tools/fpprobe/fpprobe[0-9]
+# secrets and biometric data written by the probes - never commit these
+seed.bin
+*.bin
+__pycache__/
