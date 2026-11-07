@@ -29,9 +29,14 @@ cat > "$T/bin/systemctl" <<STUB
 S="$T/svc"
 case "\$1 \$2" in
   "is-active --quiet") [ -f "\$S/active" ] ;;
-  "is-enabled fprintd.service") [ -f "\$S/masked" ] && echo masked || echo static ;;
+  "is-active fprintd.service") if [ -f "\$S/fp_active" ]; then echo active; else echo inactive; exit 3; fi ;;
+  "is-enabled fprintd.service")
+      if [ -f "\$S/masked" ]; then echo masked; elif [ -f "\$S/fp_enabled" ]; then echo enabled; else echo static; fi ;;
   "mask fprintd.service") touch "\$S/masked" ;;
   "unmask fprintd.service") rm -f "\$S/masked" ;;
+  "enable fprintd.service") touch "\$S/fp_enabled" ;;
+  "start fprintd.service") touch "\$S/fp_active" ;;
+  "stop fprintd.service") rm -f "\$S/fp_active" ;;
   "restart cros-fprintd.service") if [ -f "\$S/will_start" ]; then touch "\$S/active"; else rm -f "\$S/active"; fi ;;
   "disable --now") rm -f "\$S/active" ;;
   *) exit 0 ;;
@@ -98,6 +103,37 @@ check '[ -e "$D/var/lib/cros-fprintd/seed" ]' "state kept without --purge"
 check '[ ! -f "$T/svc/masked" ]' "stock fprintd unmasked"
 run --uninstall --purge
 check '[ ! -e "$D/var/lib/cros-fprintd" ]' "--purge removes the state"
+
+echo "== administrator had masked fprintd on purpose -> stays masked after uninstall"
+rm -rf "$D" "$T/svc"/*; touch "$T/svc/will_start" "$T/svc/masked"
+run; run --uninstall
+check '[ -f "$T/svc/masked" ]' "fprintd still masked"
+
+echo "== administrator had enabled and started fprintd -> restored after uninstall"
+rm -rf "$D" "$T/svc"/*; touch "$T/svc/will_start" "$T/svc/fp_enabled" "$T/svc/fp_active"
+run
+check '[ -f "$T/svc/masked" ] && [ ! -f "$T/svc/fp_active" ]' "fprintd masked and stopped while installed"
+run --uninstall
+check '[ ! -f "$T/svc/masked" ] && [ -f "$T/svc/fp_enabled" ] && [ -f "$T/svc/fp_active" ]' \
+      "fprintd unmasked, enabled and running again"
+
+echo "== failed fresh install restores an enabled, running fprintd"
+rm -rf "$D" "$T/svc"/*; touch "$T/svc/fp_enabled" "$T/svc/fp_active"
+run
+check '[ ! -f "$T/svc/masked" ] && [ -f "$T/svc/fp_enabled" ] && [ -f "$T/svc/fp_active" ]' \
+      "fprintd unmasked, enabled and running again after rollback"
+
+echo "== upgrade keeps the original record; install from an older version records 'unknown'"
+rm -rf "$D" "$T/svc"/*; touch "$T/svc/will_start" "$T/svc/fp_enabled"
+run; first="$(cat "$D/var/lib/cros-fprintd/installer-fprintd-state")"
+run; second="$(cat "$D/var/lib/cros-fprintd/installer-fprintd-state")"
+check '[ "$first" = "$second" ] && [ "${first%% *}" = enabled ]' "upgrade keeps the first record ($second)"
+rm -f "$D/var/lib/cros-fprintd/installer-fprintd-state"
+run
+check '[ "$(cut -d" " -f1 "$D/var/lib/cros-fprintd/installer-fprintd-state")" = unknown ]' \
+      "upgrade from a version without a record stores 'unknown'"
+run --uninstall
+check '[ ! -f "$T/svc/masked" ] && grep -q "wasn.t recorded\|unknown" "$T/out"' "unknown state: unmasked, as before"
 
 echo "RESULT: $([ $FAILED -eq 0 ] && echo "ALL PASSED" || echo FAILED)"
 exit $FAILED

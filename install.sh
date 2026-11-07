@@ -122,10 +122,31 @@ check_all() {
     echo "All requirements met."
 }
 
+# The stock fprintd's state before the first install, so uninstalling can put it back
+# exactly (an administrator may have masked or enabled it on purpose).
+FPRINTD_STATE_FILE=$STATE/installer-fprintd-state
+
+restore_fprintd() {      # restore_fprintd <is-enabled state> <is-active state>
+    case "$1" in
+        masked) ;;                                    # was masked before: keep it masked
+        *)  systemctl unmask fprintd.service 2>/dev/null || true
+            if [ "$1" = enabled ]; then systemctl enable fprintd.service 2>/dev/null || true; fi
+            if [ "$2" = active ]; then systemctl start fprintd.service 2>/dev/null || true; fi ;;
+    esac
+}
+
 case "${1:-}" in
     --uninstall)
         systemctl disable --now cros-fprintd.service 2>/dev/null || true
-        systemctl unmask fprintd.service 2>/dev/null || true
+        if [ -r "$FPRINTD_STATE_FILE" ]; then
+            read -r prev_enabled prev_active < "$FPRINTD_STATE_FILE" || true
+            restore_fprintd "${prev_enabled:-unknown}" "${prev_active:-inactive}"
+            echo "restored the stock fprintd service to its previous state (${prev_enabled:-unknown})"
+            rm -f "$FPRINTD_STATE_FILE"
+        else
+            systemctl unmask fprintd.service 2>/dev/null || true
+            echo "unmasked the stock fprintd service (its state before installation wasn't recorded)"
+        fi
         rm -f "$BIN" "$UNIT" "$UDEV_RULE" "$DROPIN_DIR/stop-on-suspend.conf"
         if rmdir "$DROPIN_DIR" 2>/dev/null || [ ! -d "$DROPIN_DIR" ]; then :; else
             echo "left $DROPIN_DIR in place: it contains drop-ins this installer didn't create"
@@ -156,13 +177,15 @@ dnf install -y fprintd fprintd-pam python3-gobject
 
 # --- install, with rollback to the previous state if any step fails -----------
 BACKUP="$(mktemp -d)"
-WAS_MASKED=no
-[ "$(systemctl is-enabled fprintd.service 2>/dev/null || true)" = masked ] && WAS_MASKED=yes
+PREV_ENABLED="$(systemctl is-enabled fprintd.service 2>/dev/null || true)"
+PREV_ACTIVE="$(systemctl is-active fprintd.service 2>/dev/null || true)"
 WAS_ACTIVE=no
 systemctl is-active --quiet cros-fprintd.service && WAS_ACTIVE=yes
 for f in "$BIN" "$UNIT" "$UDEV_RULE" "$DROPIN_DIR/stop-on-suspend.conf"; do
     if [ -e "$f" ]; then cp -a "$f" "$BACKUP/$(basename "$f")"; fi
 done
+UPGRADE=no
+[ -e "$UNIT" ] && UPGRADE=yes
 
 rollback() {
     trap - ERR
@@ -176,7 +199,7 @@ rollback() {
             rm -f "$f"
         fi
     done
-    [ "$WAS_MASKED" = yes ] || systemctl unmask fprintd.service 2>/dev/null || true
+    restore_fprintd "${PREV_ENABLED:-unknown}" "${PREV_ACTIVE:-inactive}"
     udevadm control --reload-rules 2>/dev/null || true
     systemctl daemon-reload
     if [ "$WAS_ACTIVE" = yes ]; then
@@ -213,6 +236,15 @@ if ! systemctl is-active --quiet cros-fprintd.service; then
 fi
 trap - ERR
 rm -rf "$BACKUP"
+if [ ! -e "$FPRINTD_STATE_FILE" ]; then
+    install -d -m 0700 "$STATE"
+    if [ "$UPGRADE" = yes ]; then
+        echo "unknown inactive" > "$FPRINTD_STATE_FILE"
+    else
+        echo "${PREV_ENABLED:-unknown} ${PREV_ACTIVE:-inactive}" > "$FPRINTD_STATE_FILE"
+    fi
+    chmod 0600 "$FPRINTD_STATE_FILE"
+fi
 systemctl --no-pager --full status cros-fprintd.service || true
 
 if ! authselect current 2>/dev/null | grep -q with-fingerprint; then

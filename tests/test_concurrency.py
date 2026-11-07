@@ -18,12 +18,13 @@ a.call("VerifyStart", "(s)", ("any",))       # worker now busy loading for ~3 s
 time.sleep(0.3)
 a.call("Release")                              # worker is still running
 
-check(b.error_of("Claim", "(s)", ("",)) is None, "client B can claim after A released")
-err = b.error_of("VerifyStart", "(s)", ("any",))
+err = b.error_of("Claim", "(s)", ("",))
 check(err == "net.reactivated.Fprint.Error.AlreadyInUse",
-      f"B cannot start while A's worker still runs (got {err})")
+      f"B cannot claim while A's released worker still runs (got {err})")
 
-started = wait_for(lambda: b.error_of("VerifyStart", "(s)", ("any",)) is None, timeout=15)
+claimed = wait_for(lambda: b.error_of("Claim", "(s)", ("",)) is None, timeout=15)
+check(claimed, "B can claim once A's worker has finished")
+started = claimed and b.error_of("VerifyStart", "(s)", ("any",)) is None
 check(started, "B can start once A's worker has finished")
 if started:
     check(wait_for(lambda: b.status("VerifyStatus")), "B's verify completes")

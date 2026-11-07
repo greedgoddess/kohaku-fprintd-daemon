@@ -54,6 +54,8 @@ echo "---- storage"
 python3 "$HERE/test_store.py" || RC=1
 run_suite "D-Bus API"      "$TMP/s1" test_fake_dbus.py
 run_suite "lockout"        "$TMP/s2" test_lockout.py FAKE_NEVER_MATCH=1
+run_suite "lockout reset and expiry" "$TMP/s7" test_lockout_reset.py \
+    FAKE_MATCH_PATTERN=nnnnynnnnnn FAKE_LOCKOUT_SECONDS=3
 run_suite "invalid index"  "$TMP/s3" test_bad_index.py FAKE_MATCH_INDEX=9
 run_suite "worker lifetime" "$TMP/s5" test_concurrency.py FAKE_LOAD_DELAY=3
 run_suite "delete during verify" "$TMP/s6" test_delete_race.py FAKE_MATCH_INDEX=0 FAKE_LOAD_DELAY=2

@@ -507,6 +507,8 @@ class Service:
         user = self._resolve_user(sender, args[0])
         if self.claimed_by is not None:
             raise FprintError("AlreadyInUse", "Device was already claimed")
+        if self.session is not None:         # a released worker is still finishing
+            raise FprintError("AlreadyInUse", "Device is busy finishing a previous operation")
         self.claimed_by, self.user = sender, user
         log.info("device claimed by %s for user %s", sender, user)
 
