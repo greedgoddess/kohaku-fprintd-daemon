@@ -26,7 +26,7 @@ the user. Template files never leave the machine and are only readable by root.
 Tests run it on a private session bus with a simulated MCU: see tests/fake_daemon.py.
 """
 import argparse
-import errno
+import contextlib
 import fcntl
 import hashlib
 import hmac
@@ -35,8 +35,10 @@ import logging
 import os
 import pwd
 import select
+import stat
 import struct
 import sys
+import tempfile
 import threading
 import time
 
@@ -71,6 +73,8 @@ EV_MATCH = 1 << 28
 SEED_STRUCT_VERSION = 4
 TEMPLATE_COMMIT = 0x80000000
 CHUNK = 512
+MAX_TEMPLATE_BYTES = 1 << 20               # sanity limit for MCU-reported and on-disk templates
+MAX_TEMPLATES = 15                         # the frame index has 4 bits (index 1..15)
 MAX_FAILED_MATCHES = 5                     # consecutive failures before a lockout
 LOCKOUT_SECONDS = 600                      # fingerprint refused for 10 minutes after that
 ENROLL_STAGES = 12                         # estimate; GNOME uses it for its progress ring
@@ -191,24 +195,34 @@ class Mcu:
         tsize, = struct.unpack_from("<I", b, 32)
         tmax, tvalid = struct.unpack_from("<HH", b, 36)
         dirty, = struct.unpack_from("<I", b, 40)
+        if not 0 < tsize <= MAX_TEMPLATE_BYTES or not 0 < tmax <= MAX_TEMPLATES or tvalid > tmax:
+            raise McuError(f"implausible fp_info reply (size {tsize}, max {tmax}, valid {tvalid})")
         self._template_size = tsize
         return {"template_size": tsize, "max": tmax, "valid": tvalid, "dirty": dirty}
 
-    def load_template(self, blob):
-        size = self.info()["template_size"]
-        if len(blob) != size:
-            raise McuError(f"stored template is {len(blob)} bytes, expected {size}")
+    @property
+    def template_size(self):
+        if self._template_size is None:
+            self.info()
+        return self._template_size
+
+    def _chunks(self):
+        size = self.template_size
         for off in range(0, size, CHUNK):
-            part = blob[off:off + CHUNK]
-            last = off + len(part) == size
-            hdr = struct.pack("<II", off, len(part) | (TEMPLATE_COMMIT if last else 0))
-            self._ok(CMD_FP_TEMPLATE, 0, hdr + part)
+            yield off, min(CHUNK, size - off), off + CHUNK >= size
+
+    def load_template(self, blob):
+        if len(blob) != self.template_size:
+            raise McuError(f"stored template is {len(blob)} bytes, expected {self.template_size}")
+        for off, n, last in self._chunks():
+            hdr = struct.pack("<II", off, n | (TEMPLATE_COMMIT if last else 0))
+            self._ok(CMD_FP_TEMPLATE, 0, hdr + blob[off:off + n])
 
     def read_template(self, index):
-        size = self.info()["template_size"]
+        if not 0 <= index < MAX_TEMPLATES:
+            raise McuError(f"template index {index} out of range")
         out = bytearray()
-        for off in range(0, size, CHUNK):
-            n = min(CHUNK, size - off)
+        for off, n, _ in self._chunks():
             part = self._ok(CMD_FP_FRAME, 0, struct.pack("<II", ((index + 1) << 28) | off, n), n)
             if len(part) != n:
                 raise McuError("short template read")
@@ -234,38 +248,82 @@ class Mcu:
 
 # ------------------------------------------------------------------ storage --
 def atomic_write(path, data):
-    tmp = f"{path}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    """Write through an unpredictable temporary file in the same directory, then rename."""
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=d)        # O_EXCL, mode 0600
     try:
-        os.write(fd, data)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(tmp, path)
-    dfd = os.open(os.path.dirname(path), os.O_RDONLY)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise
+    dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(dfd)
     finally:
         os.close(dfd)
 
 
+def check_private(st, path):
+    """Refuse files that aren't ours alone (regular file, owner = us, no group/other bits)."""
+    if not stat.S_ISREG(st.st_mode):
+        raise PermissionError(f"{path} is not a regular file")
+    if st.st_uid != os.geteuid():
+        raise PermissionError(f"{path} is owned by uid {st.st_uid}, expected {os.geteuid()}")
+    if st.st_mode & 0o077:
+        raise PermissionError(f"{path} is accessible to other users "
+                              f"(mode {oct(stat.S_IMODE(st.st_mode))})")
+
+
+def read_private(path, max_bytes):
+    """Read a private regular file without following symlinks, with a size limit."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        check_private(st, path)
+        if st.st_size > max_bytes:
+            raise ValueError(f"{path} is too large ({st.st_size} bytes)")
+        return os.read(fd, max_bytes + 1)
+    finally:
+        os.close(fd)
+
+
+def ensure_private_dir(path):
+    """Create the directory if needed. It must be a real directory owned by us; group and
+    other permissions are removed if present (the files inside are checked separately)."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+        raise PermissionError(f"{path} must be a directory owned by uid {os.geteuid()}")
+    if st.st_mode & 0o077:
+        log.warning("tightening permissions of %s (was %s)", path, oct(stat.S_IMODE(st.st_mode)))
+        os.chmod(path, 0o700)
+
+
 class Store:
+    """Seed and per-user templates under the state directory (all private to root)."""
+
     def __init__(self, root):
         self.root = root
-        os.makedirs(os.path.join(root, "users"), mode=0o700, exist_ok=True)
-        os.chmod(root, 0o700)
+        self.lock = threading.RLock()
+        self._generation = {}            # bumped on deletion, so late writes can't resurrect prints
+        ensure_private_dir(root)
+        ensure_private_dir(os.path.join(root, "users"))
         seed_path = os.path.join(root, "seed")
         self.seed_is_new = False
         try:
-            with open(seed_path, "rb") as f:
-                self.seed = f.read()
-            if len(self.seed) != 32:
-                raise SystemExit(f"{seed_path} must be exactly 32 bytes")
+            self.seed = read_private(seed_path, 32)
         except FileNotFoundError:
             self.seed = os.urandom(32)
             atomic_write(seed_path, self.seed)
             self.seed_is_new = True
             log.info("created new seed file %s", seed_path)
+        if len(self.seed) != 32:
+            raise ValueError(f"{seed_path} must be exactly 32 bytes")
 
     def userid(self, user):
         return hmac.new(self.seed, b"cros-fprintd user:" + user.encode(), hashlib.sha256).digest()
@@ -275,40 +333,47 @@ class Store:
             raise FprintError("Internal", "bad user name")
         return os.path.join(self.root, "users", user)
 
+    def generation(self, user):
+        with self.lock:
+            return self._generation.get(user, 0)
+
     def fingers(self, user):
         """Enrolled finger names in MCU load order."""
         d = self._dir(user)
         try:
-            with open(os.path.join(d, "fingers.json")) as f:
-                order = json.load(f)["order"]
-        except (FileNotFoundError, ValueError, KeyError):
+            order = json.loads(read_private(os.path.join(d, "fingers.json"), 4096))["order"]
+        except FileNotFoundError:
+            return []
+        except (ValueError, KeyError, TypeError, PermissionError) as e:
+            log.error("ignoring fingers.json of %s: %s", user, e)
             return []
         return [x for x in order if x in FINGERS and os.path.exists(os.path.join(d, x + ".bin"))]
 
     def read_finger(self, user, finger):
-        with open(os.path.join(self._dir(user), finger + ".bin"), "rb") as f:
-            return f.read()
+        return read_private(os.path.join(self._dir(user), finger + ".bin"), MAX_TEMPLATE_BYTES)
 
-    def write_finger(self, user, finger, blob):
-        d = self._dir(user)
-        os.makedirs(d, mode=0o700, exist_ok=True)
-        atomic_write(os.path.join(d, finger + ".bin"), blob)
-
-    def set_order(self, user, order):
-        atomic_write(os.path.join(self._dir(user), "fingers.json"),
-                     json.dumps({"order": order}).encode())
+    def save(self, user, generation, templates=None, order=None):
+        """Write templates ({finger: blob}) and/or the finger order, unless prints were
+        deleted since `generation` was taken. Returns False if skipped."""
+        with self.lock:
+            if generation != self._generation.get(user, 0):
+                log.info("not saving fingers of %s: they were deleted meanwhile", user)
+                return False
+            d = self._dir(user)
+            ensure_private_dir(d)
+            for finger, blob in (templates or {}).items():
+                atomic_write(os.path.join(d, finger + ".bin"), blob)
+            if order is not None:
+                atomic_write(os.path.join(d, "fingers.json"), json.dumps({"order": order}).encode())
+            return True
 
     def delete_all(self, user):
-        d = self._dir(user)
-        for finger in list(FINGERS):
-            try:
-                os.unlink(os.path.join(d, finger + ".bin"))
-            except FileNotFoundError:
-                pass
-        try:
-            os.unlink(os.path.join(d, "fingers.json"))
-        except FileNotFoundError:
-            pass
+        with self.lock:
+            self._generation[user] = self._generation.get(user, 0) + 1
+            d = self._dir(user)
+            for name in [f + ".bin" for f in FINGERS] + ["fingers.json"]:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(os.path.join(d, name))
 
 
 # ------------------------------------------------------------------ service --
@@ -343,12 +408,14 @@ class Lockout:
 
 
 class Session:
-    def __init__(self, kind):
+    def __init__(self, kind, user):
         self.kind = kind                      # "verify" or "enroll"
+        self.user = user
         self.stop = threading.Event()         # asks the worker to end
         self.finished = threading.Event()     # worker has ended
         self.thread = None
         self.waiters = []                     # pending VerifyStop/EnrollStop replies
+        self.released = False                 # claim dropped; forget the session once it ends
 
 
 class Service:
@@ -433,23 +500,25 @@ class Service:
         self.release()
 
     def release(self):
+        """Drop the claim. A running worker is told to stop, and the device stays busy
+        until it has really ended, so two workers never use the MCU at the same time."""
         sess = self.session
         if sess:
             sess.stop.set()
-            if sess.thread:
-                sess.thread.join(timeout=10)
-            self.session = None
+            sess.released = True
+            if sess.finished.is_set():
+                self.session = None
         self.claimed_by = self.user = None
 
     def _start(self, kind, target, finger):
         if self.session is not None:
             raise FprintError("AlreadyInUse", "Device is busy")
-        sess = Session(kind)
+        sess = Session(kind, self.user)
         self.session = sess
 
         def run():
             try:
-                target(self.user, finger, sess.stop)
+                target(sess.user, finger, sess.stop)
             finally:
                 sess.finished.set()
                 GLib.idle_add(self._worker_finished, sess)
@@ -459,7 +528,7 @@ class Service:
         return sess
 
     def _worker_finished(self, sess):
-        if self.session is sess and sess.waiters:
+        if self.session is sess and (sess.waiters or sess.released):
             self.session = None
             for inv in sess.waiters:
                 inv.return_value(None)
@@ -497,33 +566,42 @@ class Service:
         return self._start("enroll", self._enroll_worker, finger)
 
     # -- MCU workflows (run in worker threads) -----------------------------
-    def _prepare_user(self, user, fingers):
+    def _prepare_user(self, user, fingers, stop):
         """Seed + context + load the given fingers' templates. Returns the loaded names."""
         self.mcu.ensure_seed(self.store.seed, self.store.seed_is_new)
         self.store.seed_is_new = False
         self.mcu.set_context(self.store.userid(user))
         loaded = []
         for f in fingers:
+            if stop.is_set():
+                break
             try:
                 self.mcu.load_template(self.store.read_finger(user, f))
                 loaded.append(f)
-            except (McuError, OSError) as e:
+            except (McuError, OSError, ValueError) as e:
                 log.error("could not load %s for %s: %s", f, user, e)
         return loaded
 
-    def _save_if_dirty(self, user, loaded):
+    def _save_if_dirty(self, user, loaded, generation):
         try:
             if loaded and self.mcu.info()["dirty"]:
-                for i, f in enumerate(loaded):
-                    self.store.write_finger(user, f, self.mcu.read_template(i))
-                log.info("saved updated templates for %s", user)
+                blobs = {f: self.mcu.read_template(i) for i, f in enumerate(loaded)}
+                if self.store.save(user, generation, templates=blobs):
+                    log.info("saved updated templates for %s", user)
         except (McuError, OSError) as e:
             log.error("could not save updated templates for %s: %s", user, e)
 
-    def _verify_worker(self, user, finger, stop):
-        loaded = []
+    def _finish_mcu(self):
+        self._set_finger_needed(False)
         try:
-            loaded = self._prepare_user(user, self.store.fingers(user))
+            self.mcu.set_mode(MODE_IDLE)
+        except McuError as e:
+            log.error("could not set idle mode: %s", e)
+
+    def _verify_worker(self, user, finger, stop):
+        loaded, generation = [], self.store.generation(user)
+        try:
+            loaded = self._prepare_user(user, self.store.fingers(user), stop)
             if not loaded:
                 self._emit("VerifyStatus", "(sb)", ("verify-unknown-error", True))
                 return
@@ -537,9 +615,14 @@ class Service:
                     continue
                 err, idx = ev & 0xF, (ev >> 12) & 0xF
                 if err in (1, 3, 5):
-                    name = loaded[idx] if idx < len(loaded) else None
-                    ok = finger == "any" or name == finger
-                    log.info("match for %s: %s", user, name)
+                    if idx >= len(loaded):        # never trust an index we didn't load
+                        log.warning("MCU reported a match for invalid template index %d", idx)
+                        self.lockout.failed(user)
+                        self._emit("VerifyStatus", "(sb)", ("verify-unknown-error", True))
+                        return
+                    name = loaded[idx]
+                    ok = finger in ("any", name)
+                    log.info("match for %s: %s%s", user, name, "" if ok else f" (wanted {finger})")
                     (self.lockout.succeeded if ok else self.lockout.failed)(user)
                     self._emit("VerifyStatus", "(sb)", ("verify-match" if ok else "verify-no-match", True))
                     return
@@ -552,25 +635,25 @@ class Service:
                     self._emit("VerifyStatus", "(sb)", ("verify-retry-scan", False))
                     self.mcu.set_mode(MODE_MATCH)
                     continue
+                log.warning("MCU match error code %d for %s", err, user)
                 self._emit("VerifyStatus", "(sb)", ("verify-unknown-error", True))
                 return
-        except Exception as e:                        # noqa: BLE001 - report, don't crash
+        except (McuError, OSError, ValueError) as e:
             log.error("verify failed: %s", e)
             self._emit("VerifyStatus", "(sb)", ("verify-unknown-error", True))
+        except Exception:                             # noqa: BLE001 - a bug; report, don't crash
+            log.exception("unexpected error during verify")
+            self._emit("VerifyStatus", "(sb)", ("verify-unknown-error", True))
         finally:
-            self._set_finger_needed(False)
-            try:
-                self.mcu.set_mode(MODE_IDLE)
-            except McuError as e:
-                log.error("could not set idle mode: %s", e)
-            self._save_if_dirty(user, loaded)
+            self._finish_mcu()
+            self._save_if_dirty(user, loaded, generation)
 
     def _enroll_worker(self, user, finger, stop):
+        generation = self.store.generation(user)
         try:
             others = [f for f in self.store.fingers(user) if f != finger]
-            loaded = self._prepare_user(user, others)
-            info = self.mcu.info()
-            if len(loaded) >= info["max"]:
+            loaded = self._prepare_user(user, others, stop)
+            if len(loaded) >= self.mcu.info()["max"]:
                 self._emit("EnrollStatus", "(sb)", ("enroll-data-full", True))
                 return
             index = len(loaded)
@@ -592,10 +675,11 @@ class Service:
                 if progress >= 100 and err in (0, 2):
                     self.mcu.set_mode(MODE_IDLE)
                     blob = self.mcu.read_template(index)
-                    self.store.write_finger(user, finger, blob)
-                    self.store.set_order(user, others + [finger])
-                    log.info("enrolled %s for %s", finger, user)
-                    self._emit("EnrollStatus", "(sb)", ("enroll-completed", True))
+                    if self.store.save(user, generation, templates={finger: blob}, order=others + [finger]):
+                        log.info("enrolled %s for %s", finger, user)
+                        self._emit("EnrollStatus", "(sb)", ("enroll-completed", True))
+                    else:
+                        self._emit("EnrollStatus", "(sb)", ("enroll-failed", True))
                     return
                 if err in (0, 2):        # progress advanced (2 = finger did not move)
                     self._emit("EnrollStatus", "(sb)", ("enroll-stage-passed", False))
@@ -604,18 +688,18 @@ class Service:
                 elif err == 3:
                     self._emit("EnrollStatus", "(sb)", ("enroll-finger-not-centered", False))
                 else:
+                    log.warning("MCU enroll error code %d for %s", err, user)
                     self._emit("EnrollStatus", "(sb)", ("enroll-failed", True))
                     return
                 self.mcu.set_mode(MODE_ENROLL)
-        except Exception as e:                        # noqa: BLE001
+        except (McuError, OSError, ValueError) as e:
             log.error("enroll failed: %s", e)
             self._emit("EnrollStatus", "(sb)", ("enroll-failed", True))
+        except Exception:                             # noqa: BLE001
+            log.exception("unexpected error during enroll")
+            self._emit("EnrollStatus", "(sb)", ("enroll-failed", True))
         finally:
-            self._set_finger_needed(False)
-            try:
-                self.mcu.set_mode(MODE_IDLE)
-            except McuError as e:
-                log.error("could not set idle mode: %s", e)
+            self._finish_mcu()
 
     # -- D-Bus plumbing ---------------------------------------------------
     def on_name_owner_changed(self, conn, sender, path, iface, signal, params):
@@ -689,7 +773,11 @@ def main():
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s %(message)s")
 
-    store = Store(args.state_dir)
+    try:
+        store = Store(args.state_dir)
+    except (OSError, ValueError) as e:
+        log.error("cannot use the state directory: %s", e)
+        return 1
     try:
         mcu = Mcu(args.device)
     except OSError as e:

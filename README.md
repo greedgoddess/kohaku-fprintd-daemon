@@ -87,6 +87,8 @@ sudo ./install.sh --uninstall           # keeps your enrolled fingers
 sudo ./install.sh --uninstall --purge   # also deletes them
 ```
 
+The uninstaller removes only what the installer created. Drop-ins of your own in `/etc/systemd/system/cros-fprintd.service.d/` stay in place.
+
 ## Troubleshooting
 
 - **Logs:** `journalctl -u cros-fprintd -b`
@@ -149,8 +151,15 @@ So the lock screen asks the daemon about the reader, while the login screen neve
 
 ### Working on it
 
-- `tests/run-fake-tests.sh` runs the D-Bus API tests, including the lockout, against a simulated MCU on a private session bus, with no hardware or root needed. The simulated MCU lives in `tests/fake_daemon.py`, which loads the daemon and swaps in the fake; the shipped daemon itself contains no test hooks.
-- `systemd-analyze security cros-fprintd` shows how well the service is sandboxed. The unit scores about 1.5 ("OK"); without the hardening it's 8.2 ("EXPOSED").
+- `tests/run-fake-tests.sh` runs all tests on a private session bus, with no hardware or root needed. It waits until each daemon is on the bus instead of sleeping, and cleans up after itself. The suites are:
+  - **storage:** private files, size limits, deletion races;
+  - **D-Bus API:** the main suite;
+  - **lockout;**
+  - **invalid match index;**
+  - **unsafe seed:** a world-readable seed must be refused.
+
+  The simulated MCU lives in `tests/fake_daemon.py`, which loads the daemon and swaps in the fake. The shipped daemon itself contains no test hooks.
+- `systemd-analyze security cros-fprintd` shows how well the service is sandboxed. The unit scores about 1.1 ("OK"); without the hardening it's 8.2 ("EXPOSED").
 - `FPRINTD_CHECK_ROOT=/some/fake/root ./install.sh --check` runs the installer's checks against a fake `/sys` tree. That's useful for testing the support checks without the hardware.
 - With `-v`, the daemon logs every D-Bus request with the caller's uid. Refused requests are always logged as warnings. To turn it on for the installed service:
 
@@ -164,14 +173,31 @@ So the lock screen asks the daemon about the reader, while the login screen neve
 
 ### Releasing
 
-The release tarball contains only the user-facing files: the daemon, installer, unit, udev rule, README, LICENSE and a `VERSION` file. Its file name stays `kohaku-fprintd.tar.gz` for every release, so the `releases/latest/download/` link in [Install](#install) always points at the newest one.
+The release tarball contains only the user-facing files: the daemon, installer, unit, udev rule, README, LICENSE and a `VERSION` file with the tag and commit. Its file name stays `kohaku-fprintd.tar.gz` for every release, so the `releases/latest/download/` link in [Install](#install) always points at the newest one.
+
+`scripts/make-release.sh` builds it from the tag, not from the working tree. Before packing, it:
+
+1. **Checks the tag:** if the tag is signed, it verifies the signature. An unsigned tag gives a warning.
+2. **Scans for secrets:** it refuses to build if anything tracked at the tag looks like private data (`seed`, `*.bin`, keys) or contains secrets such as private keys or access tokens.
+3. **Builds reproducibly:** files are sorted, timestamps come from the commit, and owners are normalised. The same tag always gives a byte-identical tarball, so anyone can rebuild it and compare the checksum.
+
+**Signed tags with your SSH key** (one-time setup). The same key you push with can sign tags. Add it on GitHub as a *signing* key too, so tags show as "Verified":
 
 ```bash
-git tag -a v0.8.0 -m "v0.8.0"
-git push origin v0.8.0
-scripts/make-release.sh v0.8.0        # writes dist/kohaku-fprintd.tar.gz and its .sha256
-gh release create v0.8.0 dist/kohaku-fprintd.tar.gz dist/kohaku-fprintd.tar.gz.sha256 \
-    --title "v0.8.0" --notes "What changed, and which firmware it was tested on"
+git config --global gpg.format ssh
+git config --global user.signingkey ~/.ssh/id_ed25519.pub
+echo "$(git config user.email) $(cat ~/.ssh/id_ed25519.pub)" >> ~/.ssh/allowed_signers
+git config --global gpg.ssh.allowedSignersFile ~/.ssh/allowed_signers
+```
+
+Then, for each release:
+
+```bash
+git tag -s v0.9.0 -m "v0.9.0"
+git push origin v0.9.0
+scripts/make-release.sh v0.9.0        # writes dist/kohaku-fprintd.tar.gz and its .sha256
+gh release create v0.9.0 dist/kohaku-fprintd.tar.gz dist/kohaku-fprintd.tar.gz.sha256 \
+    --title "v0.9.0" --notes "What changed, and which firmware it was tested on"
 ```
 
 Without the `gh` tool, create the release on GitHub (Releases → Draft a new release → choose the tag) and attach the two files from `dist/`.
@@ -189,10 +215,20 @@ Without the `gh` tool, create the release on GitHub (Releases → Draft a new re
   - **Privileges:** no capabilities at all. It runs as root only because of D-Bus policy and file ownership.
   - **Devices:** `/dev/cros_fp` is the only device it can open.
   - **System calls:** limited to `@system-service`; anything else fails with `EPERM`.
+  - **Memory:** no memory that is both writable and executable (`MemoryDenyWriteExecute=yes`). The test suites pass with the daemon under the kernel's equivalent restriction.
+  - **Processes and IPC:** only its own processes are visible in `/proc`, and there's no System V IPC and no shared kernel keyring.
   - **Python:** runs in isolated mode (`python3 -I`), which ignores `PYTHON*` environment variables and user site-packages.
-
-  `MemoryDenyWriteExecute=` is not set, because Python's GObject bindings may need executable memory for callbacks.
 - **Error messages:** unexpected errors are logged to the journal; D-Bus callers only get a generic message, so no file paths or internals leak to unprivileged users.
+- **Match results are checked:** a match counts only if the MCU names a template index that the daemon actually loaded. Anything else is treated as an error and counts towards the lockout.
+- **Private files:**
+  - The seed and templates are read without following symlinks.
+  - They must be regular files owned by the service user, with no group or other permissions; otherwise the daemon refuses them.
+  - Templates are limited in size.
+  - State directories are created with mode 0700, and tightened if they're more open.
+  - Writes go through unpredictable temporary files (`mkstemp`) and an atomic rename.
+- **No resurrected prints:** deleting a user's fingers bumps a counter. A verify or enrol that was already running then can't write its templates back afterwards.
+- **One worker at a time:** releasing the device stops a running verify or enrol, and the device stays busy until that worker has really finished, so two workers never use the MCU at once.
+- **Installer rollback:** before overwriting anything, the installer backs up the previous files. If any step fails, or the new service doesn't come up, it restores them, and unmasks the stock `fprintd` if it wasn't masked before.
 
 ### Known limitations
 

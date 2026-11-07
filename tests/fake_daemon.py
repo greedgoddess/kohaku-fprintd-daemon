@@ -4,7 +4,8 @@
 
     tests/fake_daemon.py --state-dir /tmp/x [-v]
 
-FAKE_NEVER_MATCH=1 makes every match attempt fail (used by the lockout test).
+FAKE_NEVER_MATCH=1 makes every match attempt fail (lockout test);
+FAKE_MATCH_INDEX=n reports every attempt as a match for template index n (invalid-index test).
 Not installed and not part of the release: the shipped daemon has no test hooks.
 """
 import importlib.machinery
@@ -21,6 +22,7 @@ _loader.exec_module(daemon)
 
 EV_ENROLL, EV_MATCH = daemon.EV_ENROLL, daemon.EV_MATCH
 NEVER_MATCH = os.environ.get("FAKE_NEVER_MATCH") == "1"
+MATCH_INDEX = os.environ.get("FAKE_MATCH_INDEX")      # always report a match with this index
 
 
 class FakeMcu:
@@ -70,6 +72,8 @@ class FakeMcu:
         if self.mode & (1 << 6):                       # MATCH armed
             self.mode &= ~(1 << 6)
             self.matches += 1
+            if MATCH_INDEX is not None:
+                return EV_MATCH | (int(MATCH_INDEX) << 12) | 1
             if NEVER_MATCH or self.matches % 2 == 1 or not self.templates:
                 return EV_MATCH | (0xF << 12)          # no match
             self.dirty = 1

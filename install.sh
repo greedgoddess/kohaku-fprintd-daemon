@@ -123,8 +123,10 @@ case "${1:-}" in
     --uninstall)
         systemctl disable --now cros-fprintd.service 2>/dev/null || true
         systemctl unmask fprintd.service 2>/dev/null || true
-        rm -f "$BIN" "$UNIT" "$UDEV_RULE"
-        rm -rf "$DROPIN_DIR"
+        rm -f "$BIN" "$UNIT" "$UDEV_RULE" "$DROPIN_DIR/stop-on-suspend.conf"
+        if rmdir "$DROPIN_DIR" 2>/dev/null || [ ! -d "$DROPIN_DIR" ]; then :; else
+            echo "left $DROPIN_DIR in place: it contains drop-ins this installer didn't create"
+        fi
         udevadm control --reload-rules 2>/dev/null || true
         systemctl daemon-reload
         if [ "${2:-}" = "--purge" ]; then
@@ -149,6 +151,43 @@ check_all
 
 dnf install -y fprintd fprintd-pam python3-gobject
 
+# --- install, with rollback to the previous state if any step fails -----------
+BACKUP="$(mktemp -d)"
+WAS_MASKED=no
+[ "$(systemctl is-enabled fprintd.service 2>/dev/null || true)" = masked ] && WAS_MASKED=yes
+WAS_ACTIVE=no
+systemctl is-active --quiet cros-fprintd.service && WAS_ACTIVE=yes
+for f in "$BIN" "$UNIT" "$UDEV_RULE" "$DROPIN_DIR/stop-on-suspend.conf"; do
+    if [ -e "$f" ]; then cp -a "$f" "$BACKUP/$(basename "$f")"; fi
+done
+
+rollback() {
+    trap - ERR
+    echo >&2
+    echo "Installation failed - restoring the previous state." >&2
+    for f in "$BIN" "$UNIT" "$UDEV_RULE" "$DROPIN_DIR/stop-on-suspend.conf"; do
+        if [ -e "$BACKUP/$(basename "$f")" ]; then
+            install -d "$(dirname "$f")"
+            cp -a "$BACKUP/$(basename "$f")" "$f"
+        else
+            rm -f "$f"
+        fi
+    done
+    [ "$WAS_MASKED" = yes ] || systemctl unmask fprintd.service 2>/dev/null || true
+    udevadm control --reload-rules 2>/dev/null || true
+    systemctl daemon-reload
+    if [ "$WAS_ACTIVE" = yes ]; then
+        systemctl restart cros-fprintd.service 2>/dev/null || true
+    else
+        systemctl disable --now cros-fprintd.service 2>/dev/null || true
+    fi
+    rm -rf "$BACKUP"
+    echo "See: journalctl -u cros-fprintd -b" >&2
+    exit 1
+}
+set -E
+trap rollback ERR
+
 install -D -o root -g root -m 0755 "$HERE/cros-fprintd" "$BIN"
 install -D -o root -g root -m 0644 "$HERE/systemd/cros-fprintd.service" "$UNIT"
 install -D -o root -g root -m 0644 "$HERE/udev/70-cros-fprintd.rules" "$UDEV_RULE"
@@ -164,9 +203,14 @@ systemctl mask fprintd.service
 systemctl daemon-reload
 systemctl enable cros-fprintd.service
 systemctl restart cros-fprintd.service
-sleep 1
-systemctl --no-pager --full status cros-fprintd.service || {
-    echo; echo "service failed to start; see: journalctl -u cros-fprintd -b" >&2; exit 1; }
+sleep 2
+if ! systemctl is-active --quiet cros-fprintd.service; then
+    systemctl --no-pager --full status cros-fprintd.service >&2 || true
+    rollback
+fi
+trap - ERR
+rm -rf "$BACKUP"
+systemctl --no-pager --full status cros-fprintd.service || true
 
 if ! authselect current 2>/dev/null | grep -q with-fingerprint; then
     cat <<'MSG'
