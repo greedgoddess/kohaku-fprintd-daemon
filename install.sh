@@ -329,7 +329,5 @@ Installed. Next:
      Then sudo and the lock screen accept your fingerprint; the password
      always remains as a fallback.
 
-GNOME's login screen (after boot or logout) only offers the password: GNOME
-Shell uses fingerprint for re-authentication (the lock screen) only.
 Logs: journalctl -u cros-fprintd -b
 MSG
