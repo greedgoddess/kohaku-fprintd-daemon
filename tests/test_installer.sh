@@ -170,5 +170,54 @@ run; rc=$?
 check '[ $rc -ne 0 ] && grep -q "restoring the previous state" "$T/out"' "installer fails and rolls back"
 check '[ ! -e "$BIN" ] && [ ! -e "$UNIT" ] && [ ! -f "$T/svc/masked" ]' "no half-finished installation remains"
 
+# --- other fingerprint readers
+fake_hwdb() {
+    mkdir -p "$T/sys/usr/lib/udev/hwdb.d"
+    cat > "$T/sys/usr/lib/udev/hwdb.d/60-autosuspend-libfprint-2.hwdb" <<'HWDB'
+# This file has been generated using fprint-list-udev-hwdb with all drivers enabled
+
+# Supported by libfprint driver aes1610
+usb:v08FFp1600*
+ ID_AUTOSUSPEND=1
+ ID_PERSIST=0
+
+# Supported by libfprint driver goodixmoc
+usb:v27C6p5840*
+ ID_AUTOSUSPEND=1
+ ID_PERSIST=0
+
+# Known unsupported devices
+usb:v1234p5678*
+ ID_AUTOSUSPEND=1
+ ID_PERSIST=0
+HWDB
+}
+usb_device() {     # usb_device <name> <vendor> <product>
+    mkdir -p "$T/sys/sys/bus/usb/devices/$1"
+    echo "$2" > "$T/sys/sys/bus/usb/devices/$1/idVendor"; echo "$3" > "$T/sys/sys/bus/usb/devices/$1/idProduct"
+}
+
+echo "== a connected reader supported by the stock fprintd: install asks, no answer = no change"
+fake_sys "[s2idle] deep"; fake_hwdb; usb_device 1-1 1d6b 0002; usb_device 1-2 27c6 5840
+rm -rf "$D" "$T/svc"/*; touch "$T/svc/will_start"
+run; rc=$?
+check '[ $rc -ne 0 ] && grep -q "27c6:5840 goodixmoc" "$T/out" && grep -q "Nothing was changed" "$T/out"' \
+      "installer names the reader and stops"
+check '[ ! -e "$BIN" ] && [ ! -f "$T/svc/masked" ]' "nothing installed, fprintd untouched"
+
+echo "== ...answering yes installs anyway"
+echo y | FPRINTD_CHECK_ROOT="$T/sys" FPRINTD_DESTDIR="$D" bash "$INSTALLER" >"$T/out" 2>&1; rc=$?
+check '[ $rc -eq 0 ] && [ -e "$BIN" ] && [ -f "$T/svc/masked" ]' "installed after confirmation"
+
+echo "== --check reports the reader as a note"
+FPRINTD_CHECK_ROOT="$T/sys" bash "$INSTALLER" --check </dev/null >"$T/out" 2>&1
+check 'grep -q "\[note\]" "$T/out" && grep -q "installed: 27c6:5840 goodixmoc" "$T/out"' "--check mentions the reader"
+
+echo "== a device from the 'Known unsupported' section doesn't trigger the question"
+fake_sys "[s2idle] deep"; fake_hwdb; usb_device 1-1 1d6b 0002; usb_device 1-3 1234 5678
+rm -rf "$D" "$T/svc"/*; touch "$T/svc/will_start"
+run; rc=$?
+check '[ $rc -eq 0 ] && ! grep -q "Install anyway" "$T/out"' "installs without asking"
+
 echo "RESULT: $([ $FAILED -eq 0 ] && echo "ALL PASSED" || echo FAILED)"
 exit $FAILED

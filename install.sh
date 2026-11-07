@@ -111,6 +111,22 @@ check_s0ix_works() {
     fi
 }
 
+# Connected USB readers that the stock fprintd (libfprint) supports. Masking fprintd
+# makes them stop working, so the installer asks first. Prints "vendor:product driver".
+libfprint_readers() {
+    local hwdb="$R/usr/lib/udev/hwdb.d/60-autosuspend-libfprint-2.hwdb" d
+    [ -r "$hwdb" ] || return 0
+    local supported
+    supported="$(awk '/^# Supported by libfprint driver/ { drv = $NF; on = 1; next }
+                      /^# Known unsupported devices/      { on = 0 }
+                      on && /^usb:v....p..../ { print tolower(substr($0, 6, 4)) ":" tolower(substr($0, 11, 4)) " " drv }' "$hwdb")"
+    [ -n "$supported" ] || return 0
+    for d in "$R"/sys/bus/usb/devices/*; do
+        [ -r "$d/idVendor" ] && [ -r "$d/idProduct" ] || continue
+        printf '%s\n' "$supported" | grep -i "^$(cat "$d/idVendor"):$(cat "$d/idProduct") " || true
+    done | sort -u
+}
+
 check_all() {
     check_static
     check_s0ix_works
@@ -120,6 +136,12 @@ check_all() {
         return 1
     fi
     echo "All requirements met."
+    local readers
+    readers="$(libfprint_readers)"
+    if [ -n "$readers" ]; then
+        echo "  [note] connected reader supported by the stock fprintd, which stops working while"
+        echo "         cros-fprintd is installed: $(echo "$readers" | tr '\n' ' ')"
+    fi
 }
 
 # The stock fprintd's state before the first install, so uninstalling can put it back
@@ -189,6 +211,20 @@ check_all
 [ -z "$R" ] || [ -n "$D" ] || { echo "(test mode: stopping before installing)"; exit 0; }
 
 dnf install -y fprintd fprintd-pam python3-gobject
+
+READERS="$(libfprint_readers)"
+if [ -n "$READERS" ]; then
+    echo
+    echo "A fingerprint reader supported by the stock fprintd is connected:"
+    printf '%s\n' "$READERS" | sed 's/^/    /'
+    echo "cros-fprintd replaces the stock fprintd service (it gets masked), so this reader"
+    echo "won't work while cros-fprintd is installed. Uninstalling restores it."
+    read -r -p "Install anyway? [y/N] " ans || ans=""
+    case "$ans" in
+        [yY]*) ;;
+        *) echo "Nothing was changed."; exit 1 ;;
+    esac
+fi
 
 # --- install, with rollback to the previous state if any step fails -----------
 PREV_ENABLED="$(systemctl is-enabled fprintd.service 2>/dev/null || true)"

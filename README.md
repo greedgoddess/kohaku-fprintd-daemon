@@ -31,6 +31,8 @@ The installer checks all of these and refuses to install otherwise:
 | Suspend-to-idle (s2idle) as the default sleep mode | `cat /sys/power/mem_sleep` shows `[s2idle]`. This follows automatically from the S0ix option |
 | Working S0ix | the installer verifies it, with a 20-second test suspend if needed |
 
+**Other fingerprint readers stop working while this is installed.** cros-fprintd takes the place of the stock `fprintd` service, which gets masked, and it only drives the built-in Chromebook sensor. Readers that the stock `fprintd` supports, such as USB readers, work again after uninstalling. If such a reader is connected, the installer says so and asks before changing anything.
+
 **Deep sleep (S3) is not supported.** On Kohaku, the firmware switches the fingerprint chip off when resuming from S3, and it only comes back after a full power-off.
 
 Other Chromebooks with a ChromeOS fingerprint chip may work, but only Kohaku has been tested.
@@ -92,6 +94,7 @@ The uninstaller removes only what the installer created. Drop-ins of your own in
 ## Troubleshooting
 
 - **Logs:** `journalctl -u cros-fprintd -b`
+- **A USB fingerprint reader stopped working:** that's expected while cros-fprintd is installed, because the stock `fprintd` that drives such readers is masked. Uninstall (`sudo ./install.sh --uninstall`) to use it again.
 - **The fingerprint option disappears now and then:** the [availability monitor](https://github.com/greedgoddess/kohaku-fprintd-daemon/tree/main/tools/monitor) (a development tool in the repository, not in the release) records when it happens and what state the service and MCU were in.
 - **The installer reports a failed requirement:** each line says what's missing. The usual fix is a firmware update, or switching back to s2idle if you changed the sleep mode.
 - **The reader stopped working after a suspend:** check `cat /sys/power/mem_sleep`. If it shows `[deep]`, the laptop used the unsupported S3 mode, almost always because the S0ix option in the firmware setup is off. Firmware updates reset it. Enable it (press ESC at boot), and do a full power-off to bring the reader back. `sudo ./install.sh --check` confirms the result.
@@ -159,7 +162,7 @@ So the lock screen asks the daemon about the reader, while the login screen neve
   - **invalid match index;**
   - **worker lifetime:** a released session keeps the device busy, and new claims are refused, until its worker has ended;
   - **delete during verify:** a print deleted mid-verify neither matches nor comes back;
-  - **installer:** refusal of unsupported setups, rollback on a failed fresh install and on a failed upgrade, uninstall keeping foreign drop-ins, restoring the stock `fprintd`'s previous state (masked, enabled, runtime variants, running), refusing states it can't restore, rolling back if the state record can't be written, `--purge`. It runs in a temporary directory with stubbed `systemctl`;
+  - **installer:** refusal of unsupported setups, rollback on a failed fresh install and on a failed upgrade, uninstall keeping foreign drop-ins, restoring the stock `fprintd`'s previous state (masked, enabled, runtime variants, running), refusing states it can't restore, rolling back if the state record can't be written, asking before masking `fprintd` when a reader it supports is connected (and ignoring libfprint's "known unsupported" list), `--purge`. It runs in a temporary directory with stubbed `systemctl`;
   - **unsafe seed:** a world-readable seed must be refused.
 
   The simulated MCU lives in `tests/fake_daemon.py`, which loads the daemon and swaps in the fake. The shipped daemon itself contains no test hooks.
