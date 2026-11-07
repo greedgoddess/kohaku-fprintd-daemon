@@ -6,7 +6,7 @@ The first part of this README is for installing and using it. The [Development](
 
 ## Read this first
 
-**This is experimental software, version 0.8.0. Use it with caution.**
+**This is experimental software (version 0.8). Use it with caution.**
 
 - **Built for one laptop.** It was made for, and tested on, exactly one machine: the author's Samsung Galaxy Chromebook (Kohaku) with MrChromebox firmware 2609.3, Fedora 45 and GNOME Shell 51. The installer refuses anything outside that configuration, and even within it, your machine may behave differently.
 - **Not regularly maintained.** This is a personal project, published in case it helps someone. There is no promise of updates, fixes or answers to issues and pull requests. Fedora, GNOME or firmware updates may break it at any time. You're welcome to fork it; it's MIT-licensed.
@@ -27,7 +27,8 @@ The installer checks all of these and refuses to install otherwise:
 |---|---|
 | Samsung Galaxy Chromebook (Kohaku) with a working fingerprint reader | `ls /dev/cros_fp` |
 | MrChromebox UEFI firmware **2609.3 or newer** | `cat /sys/class/dmi/id/bios_version` |
-| Suspend-to-idle (s2idle) as the default sleep mode | `cat /sys/power/mem_sleep` shows `[s2idle]` |
+| The **S0ix** option enabled in the firmware setup menu | press ESC at boot, open the setup menu, and look for the S0ix option. It was off on the test machine after a firmware update, because firmware updates reset all settings |
+| Suspend-to-idle (s2idle) as the default sleep mode | `cat /sys/power/mem_sleep` shows `[s2idle]`. This follows automatically from the S0ix option |
 | Working S0ix | the installer verifies it, with a 20-second test suspend if needed |
 
 **Deep sleep (S3) is not supported.** On Kohaku, the firmware switches the fingerprint chip off when resuming from S3, and it only comes back after a full power-off.
@@ -48,7 +49,7 @@ Other Chromebooks with a ChromeOS fingerprint chip may work, but only Kohaku has
 
 ## Install
 
-Update your firmware first, if needed, with the [MrChromebox Firmware Utility Script](https://docs.mrchromebox.tech/docs/fwscript). Then download and run the latest release:
+Update your firmware first, if needed, with the [MrChromebox Firmware Utility Script](https://docs.mrchromebox.tech/docs/fwscript). Then make sure the S0ix option is enabled in the firmware setup (press ESC at boot); after a firmware update it may be off. Then download and run the latest release:
 
 ```bash
 curl -LO https://github.com/greedgoddess/kohaku-fprintd-daemon/releases/latest/download/kohaku-fprintd.tar.gz
@@ -89,7 +90,7 @@ sudo ./install.sh --uninstall --purge   # also deletes them
 - **Logs:** `journalctl -u cros-fprintd -b`
 - **The fingerprint option disappears now and then:** the [availability monitor](https://github.com/greedgoddess/kohaku-fprintd-daemon/tree/main/tools/monitor) (a development tool in the repository, not in the release) records when it happens and what state the service and MCU were in.
 - **The installer reports a failed requirement:** each line says what's missing. The usual fix is a firmware update, or switching back to s2idle if you changed the sleep mode.
-- **The reader stopped working after a suspend:** check `cat /sys/power/mem_sleep`. If `deep` is selected, that's the unsupported S3 mode. A full power-off brings the reader back.
+- **The reader stopped working after a suspend:** check `cat /sys/power/mem_sleep`. If it shows `[deep]`, the laptop used the unsupported S3 mode, almost always because the S0ix option in the firmware setup is off. Firmware updates reset it. Enable it (press ESC at boot), and do a full power-off to bring the reader back. `sudo ./install.sh --check` confirms the result.
 - **The lock screen doesn't offer fingerprint:** check that `gsettings get org.gnome.login-screen enable-fingerprint-authentication` prints `true` (enabling `with-fingerprint` in PAM sets it), and log out and back in once. Press a key on the lock screen first, so the password field shows.
 
 ## Security
@@ -139,7 +140,7 @@ So the lock screen asks the daemon about the reader, while the login screen neve
 | `scripts/make-release.sh` | builds the release tarball |
 | `tests/` | D-Bus API tests against a simulated MCU |
 | `tools/fpprobe/` | small C programs used to work out the MCU protocol |
-| `tools/monitor/` | availability monitor that logs when and why the reader becomes unavailable |
+| `tools/monitor/` | availability and battery monitor: logs when and why the reader becomes unavailable, and the battery drain during each sleep |
 | `docs/SUSPEND-INVESTIGATION.md` | the S3 investigation, and its resolution with firmware 2609.3 |
 
 ### Working on it
@@ -154,7 +155,7 @@ So the lock screen asks the daemon about the reader, while the login screen neve
   ```
 
 - `tools/fpprobe/` contains probes for talking to the MCU by hand. See its README for which ones change the MCU's state.
-- `tools/monitor/` contains an availability monitor: a small service that logs state changes, suspend/resume and relevant journal lines, plus a `mark` command to note when something went wrong.
+- `tools/monitor/` contains an availability monitor: a small service that logs state changes, suspend/resume and relevant journal lines, plus a `mark` command to note when something went wrong and a `battery` command for the average standby drain.
 
 ### Releasing
 
