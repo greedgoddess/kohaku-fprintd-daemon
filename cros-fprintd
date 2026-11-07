@@ -451,6 +451,23 @@ class Service:
             return False
         GLib.idle_add(do)
 
+    def _emit_match_result(self, user, generation, name, ok):
+        """Report a match result from the main loop, where D-Bus deletions also run.
+        A deletion is then either entirely before this check (reported as no match)
+        or after the signal has been sent - never in between."""
+        def do():
+            matched = ok
+            if ok and self.store.generation(user) != generation:
+                log.warning("ignoring match for %s: fingers were deleted during verify", user)
+                matched = False
+            else:
+                log.info("match for %s: %s%s", user, name, "" if ok else " (not the requested finger)")
+                (self.lockout.succeeded if ok else self.lockout.failed)(user)
+            self.conn.emit_signal(None, DEV_PATH, DEV_IFACE, "VerifyStatus",
+                                  GLib.Variant("(sb)", ("verify-match" if matched else "verify-no-match", True)))
+            return False
+        GLib.idle_add(do)
+
     def _set_finger_needed(self, value):
         def do():
             self.finger_needed = value
@@ -637,15 +654,8 @@ class Service:
                         self.lockout.failed(user)
                         self._emit("VerifyStatus", "(sb)", ("verify-unknown-error", True))
                         return
-                    if self.store.generation(user) != generation:
-                        log.warning("ignoring match for %s: fingers were deleted during verify", user)
-                        self._emit("VerifyStatus", "(sb)", ("verify-no-match", True))
-                        return
                     name = loaded[idx]
-                    ok = finger in ("any", name)
-                    log.info("match for %s: %s%s", user, name, "" if ok else f" (wanted {finger})")
-                    (self.lockout.succeeded if ok else self.lockout.failed)(user)
-                    self._emit("VerifyStatus", "(sb)", ("verify-match" if ok else "verify-no-match", True))
+                    self._emit_match_result(user, generation, name, finger in ("any", name))
                     return
                 if err == 0:
                     log.info("no match for %s", user)

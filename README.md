@@ -87,7 +87,7 @@ sudo ./install.sh --uninstall           # keeps your enrolled fingers
 sudo ./install.sh --uninstall --purge   # also deletes them
 ```
 
-The uninstaller removes only what the installer created. Drop-ins of your own in `/etc/systemd/system/cros-fprintd.service.d/` stay in place. The stock `fprintd` service is returned to the state it had before the first installation: masked, enabled or default, and running if it was.
+The uninstaller removes only what the installer created. Drop-ins of your own in `/etc/systemd/system/cros-fprintd.service.d/` stay in place. The stock `fprintd` service is returned to the state it had before the first installation: masked, enabled or default (also the runtime-only variants, if no reboot happened in between), and running if it was. If `fprintd.service` is in a state that can't be restored exactly (for example `linked`), the installer stops before changing anything.
 
 ## Troubleshooting
 
@@ -153,12 +153,13 @@ So the lock screen asks the daemon about the reader, while the login screen neve
 
 - `tests/run-fake-tests.sh` runs all tests on a private session bus, with no hardware or root needed. It waits until each daemon is on the bus instead of sleeping, and cleans up after itself. The suites are:
   - **storage:** private files, size limits, deletion races;
+  - **match vs. deletion ordering:** a deletion handled before a queued match result is sent turns it into "no match";
   - **D-Bus API:** the main suite;
   - **lockout:** five failures lock; a match resets the count; the lockout expires;
   - **invalid match index;**
   - **worker lifetime:** a released session keeps the device busy, and new claims are refused, until its worker has ended;
   - **delete during verify:** a print deleted mid-verify neither matches nor comes back;
-  - **installer:** refusal of unsupported setups, rollback on a failed fresh install and on a failed upgrade, uninstall keeping foreign drop-ins, restoring the stock `fprintd`'s previous state (masked, enabled, running), `--purge`. It runs in a temporary directory with stubbed `systemctl`;
+  - **installer:** refusal of unsupported setups, rollback on a failed fresh install and on a failed upgrade, uninstall keeping foreign drop-ins, restoring the stock `fprintd`'s previous state (masked, enabled, runtime variants, running), refusing states it can't restore, rolling back if the state record can't be written, `--purge`. It runs in a temporary directory with stubbed `systemctl`;
   - **unsafe seed:** a world-readable seed must be refused.
 
   The simulated MCU lives in `tests/fake_daemon.py`, which loads the daemon and swaps in the fake. The shipped daemon itself contains no test hooks.
@@ -229,7 +230,7 @@ Without the `gh` tool, create the release on GitHub (Releases → Draft a new re
   - Templates are limited in size.
   - State directories are created with mode 0700, and tightened if they're more open.
   - Writes go through unpredictable temporary files (`mkstemp`) and an atomic rename.
-- **No resurrected prints:** deleting a user's fingers bumps a counter. A verify or enrol that was already running then can't write its templates back afterwards.
+- **No resurrected prints:** deleting a user's fingers bumps a counter. A verify or enrol that was already running then can't write its templates back afterwards. The final match decision is made on the main loop, where deletions are also handled, so a deletion either happens before the decision (no match) or after the result has been sent, never in between.
 - **One worker at a time:** releasing the device stops a running verify or enrol, and the device stays busy until that worker has really finished, so two workers never use the MCU at once.
 - **Installer rollback:** before overwriting anything, the installer backs up the previous files and notes the stock `fprintd`'s state. If any step fails, or the new service doesn't come up, it restores both. The state from before the first installation is kept in `/var/lib/cros-fprintd/installer-fprintd-state`, so uninstalling restores it too.
 - **Runs as root, without capabilities:** a non-root service would be stricter still, but needs its own D-Bus policy (the stock one only lets root own `net.reactivated.Fprint`) and its own permissions on `/dev/cros_fp`. That's a possible future step, not done yet.

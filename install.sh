@@ -126,21 +126,36 @@ check_all() {
 # exactly (an administrator may have masked or enabled it on purpose).
 FPRINTD_STATE_FILE=$STATE/installer-fprintd-state
 
-restore_fprintd() {      # restore_fprintd <is-enabled state> <is-active state>
+# States of fprintd.service that can be restored exactly. Others (linked, alias,
+# generated, transient, ...) are refused before anything is changed.
+fprintd_state_supported() {
     case "$1" in
-        masked) ;;                                    # was masked before: keep it masked
-        *)  systemctl unmask fprintd.service 2>/dev/null || true
-            if [ "$1" = enabled ]; then systemctl enable fprintd.service 2>/dev/null || true; fi
-            if [ "$2" = active ]; then systemctl start fprintd.service 2>/dev/null || true; fi ;;
+        static|indirect|disabled|enabled|enabled-runtime|masked|masked-runtime) return 0 ;;
+        *) return 1 ;;
     esac
+}
+
+BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
+
+restore_fprintd() {      # restore_fprintd <is-enabled state> <is-active state> [boot id of the record]
+    [ "$1" = masked ] && return 0                     # was masked before: keep it masked
+    systemctl unmask fprintd.service 2>/dev/null || true
+    # runtime states end with the boot they were set in; after a reboot they're already gone
+    if [ "${1%-runtime}" != "$1" ] && [ "${3:-$BOOT_ID}" != "$BOOT_ID" ]; then return 0; fi
+    case "$1" in
+        enabled)         systemctl enable fprintd.service 2>/dev/null || true ;;
+        enabled-runtime) systemctl enable --runtime fprintd.service 2>/dev/null || true ;;
+        masked-runtime)  systemctl mask --runtime fprintd.service 2>/dev/null || true; return 0 ;;
+    esac
+    if [ "$2" = active ]; then systemctl start fprintd.service 2>/dev/null || true; fi
 }
 
 case "${1:-}" in
     --uninstall)
         systemctl disable --now cros-fprintd.service 2>/dev/null || true
         if [ -r "$FPRINTD_STATE_FILE" ]; then
-            read -r prev_enabled prev_active < "$FPRINTD_STATE_FILE" || true
-            restore_fprintd "${prev_enabled:-unknown}" "${prev_active:-inactive}"
+            read -r prev_enabled prev_active prev_boot < "$FPRINTD_STATE_FILE" || true
+            restore_fprintd "${prev_enabled:-unknown}" "${prev_active:-inactive}" "${prev_boot:-unknown}"
             echo "restored the stock fprintd service to its previous state (${prev_enabled:-unknown})"
             rm -f "$FPRINTD_STATE_FILE"
         else
@@ -176,16 +191,25 @@ check_all
 dnf install -y fprintd fprintd-pam python3-gobject
 
 # --- install, with rollback to the previous state if any step fails -----------
-BACKUP="$(mktemp -d)"
 PREV_ENABLED="$(systemctl is-enabled fprintd.service 2>/dev/null || true)"
 PREV_ACTIVE="$(systemctl is-active fprintd.service 2>/dev/null || true)"
+UPGRADE=no
+[ -e "$UNIT" ] && UPGRADE=yes
+if [ "$UPGRADE" = no ] && ! fprintd_state_supported "$PREV_ENABLED"; then
+    echo "fprintd.service is in state '${PREV_ENABLED:-unknown}', which this installer can't restore" >&2
+    echo "exactly after uninstalling. Return it to a standard state first (for example" >&2
+    echo "'sudo systemctl reenable fprintd.service' or 'sudo systemctl unmask fprintd.service')." >&2
+    echo "Nothing was changed." >&2
+    exit 1
+fi
+STATE_FILE_EXISTED=no
+[ -e "$FPRINTD_STATE_FILE" ] && STATE_FILE_EXISTED=yes
+BACKUP="$(mktemp -d)"
 WAS_ACTIVE=no
 systemctl is-active --quiet cros-fprintd.service && WAS_ACTIVE=yes
 for f in "$BIN" "$UNIT" "$UDEV_RULE" "$DROPIN_DIR/stop-on-suspend.conf"; do
     if [ -e "$f" ]; then cp -a "$f" "$BACKUP/$(basename "$f")"; fi
 done
-UPGRADE=no
-[ -e "$UNIT" ] && UPGRADE=yes
 
 rollback() {
     trap - ERR
@@ -200,6 +224,7 @@ rollback() {
         fi
     done
     restore_fprintd "${PREV_ENABLED:-unknown}" "${PREV_ACTIVE:-inactive}"
+    [ "$STATE_FILE_EXISTED" = yes ] || rm -f "$FPRINTD_STATE_FILE"
     udevadm control --reload-rules 2>/dev/null || true
     systemctl daemon-reload
     if [ "$WAS_ACTIVE" = yes ]; then
@@ -234,17 +259,17 @@ if ! systemctl is-active --quiet cros-fprintd.service; then
     systemctl --no-pager --full status cros-fprintd.service >&2 || true
     rollback
 fi
+# Record the original fprintd state while rollback is still armed: if this fails,
+# the installation is undone instead of losing the information.
+if [ "$STATE_FILE_EXISTED" = no ]; then
+    install -d -m 0700 "$STATE"
+    if [ "$UPGRADE" = yes ]; then record="unknown inactive $BOOT_ID"
+    else record="${PREV_ENABLED:-unknown} ${PREV_ACTIVE:-inactive} $BOOT_ID"; fi
+    ( umask 077; printf '%s\n' "$record" > "$FPRINTD_STATE_FILE.tmp" )
+    mv -f "$FPRINTD_STATE_FILE.tmp" "$FPRINTD_STATE_FILE"
+fi
 trap - ERR
 rm -rf "$BACKUP"
-if [ ! -e "$FPRINTD_STATE_FILE" ]; then
-    install -d -m 0700 "$STATE"
-    if [ "$UPGRADE" = yes ]; then
-        echo "unknown inactive" > "$FPRINTD_STATE_FILE"
-    else
-        echo "${PREV_ENABLED:-unknown} ${PREV_ACTIVE:-inactive}" > "$FPRINTD_STATE_FILE"
-    fi
-    chmod 0600 "$FPRINTD_STATE_FILE"
-fi
 systemctl --no-pager --full status cros-fprintd.service || true
 
 if ! authselect current 2>/dev/null | grep -q with-fingerprint; then

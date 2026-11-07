@@ -52,6 +52,8 @@ run_suite() {               # run_suite <title> <state dir> <test script> [VAR=v
 
 echo "---- storage"
 python3 "$HERE/test_store.py" || RC=1
+echo "---- match vs. deletion ordering"
+python3 "$HERE/test_match_ordering.py" || RC=1
 run_suite "D-Bus API"      "$TMP/s1" test_fake_dbus.py
 run_suite "lockout"        "$TMP/s2" test_lockout.py FAKE_NEVER_MATCH=1
 run_suite "lockout reset and expiry" "$TMP/s7" test_lockout_reset.py \

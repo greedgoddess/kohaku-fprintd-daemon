@@ -31,10 +31,14 @@ case "\$1 \$2" in
   "is-active --quiet") [ -f "\$S/active" ] ;;
   "is-active fprintd.service") if [ -f "\$S/fp_active" ]; then echo active; else echo inactive; exit 3; fi ;;
   "is-enabled fprintd.service")
-      if [ -f "\$S/masked" ]; then echo masked; elif [ -f "\$S/fp_enabled" ]; then echo enabled; else echo static; fi ;;
+      if [ -f "\$S/masked" ]; then echo masked; elif [ -f "\$S/rmasked" ]; then echo masked-runtime
+      elif [ -f "\$S/fp_base" ]; then cat "\$S/fp_base"; elif [ -f "\$S/fp_enabled" ]; then echo enabled
+      else echo static; fi ;;
   "mask fprintd.service") touch "\$S/masked" ;;
-  "unmask fprintd.service") rm -f "\$S/masked" ;;
+  "mask --runtime") touch "\$S/rmasked" ;;
+  "unmask fprintd.service") rm -f "\$S/masked" "\$S/rmasked" ;;
   "enable fprintd.service") touch "\$S/fp_enabled" ;;
+  "enable --runtime") echo enabled-runtime > "\$S/fp_base" ;;
   "start fprintd.service") touch "\$S/fp_active" ;;
   "stop fprintd.service") rm -f "\$S/fp_active" ;;
   "restart cros-fprintd.service") if [ -f "\$S/will_start" ]; then touch "\$S/active"; else rm -f "\$S/active"; fi ;;
@@ -134,6 +138,37 @@ check '[ "$(cut -d" " -f1 "$D/var/lib/cros-fprintd/installer-fprintd-state")" = 
       "upgrade from a version without a record stores 'unknown'"
 run --uninstall
 check '[ ! -f "$T/svc/masked" ] && grep -q "wasn.t recorded\|unknown" "$T/out"' "unknown state: unmasked, as before"
+
+echo "== runtime mask is restored as a runtime mask"
+rm -rf "$D" "$T/svc"/*; touch "$T/svc/will_start" "$T/svc/rmasked"
+run; run --uninstall
+check '[ -f "$T/svc/rmasked" ] && [ ! -f "$T/svc/masked" ]' "masked-runtime restored (not a persistent mask)"
+
+echo "== runtime enablement is restored as runtime enablement"
+rm -rf "$D" "$T/svc"/*; touch "$T/svc/will_start"; echo enabled-runtime > "$T/svc/fp_base"
+run; rm -f "$T/svc/fp_base"; run --uninstall
+check '[ "$(cat "$T/svc/fp_base" 2>/dev/null)" = enabled-runtime ] && [ ! -f "$T/svc/masked" ]' \
+      "enabled-runtime restored"
+
+echo "== runtime state from an earlier boot is not re-created"
+rm -rf "$D" "$T/svc"/*; touch "$T/svc/will_start" "$T/svc/rmasked"
+run; rm -f "$T/svc/rmasked"          # a reboot clears the runtime mask
+sed -i 's/ [^ ]*$/ some-earlier-boot/' "$D/var/lib/cros-fprintd/installer-fprintd-state"
+run --uninstall
+check '[ ! -f "$T/svc/rmasked" ] && [ ! -f "$T/svc/masked" ]' "expired runtime mask not re-applied"
+
+echo "== a state that can't be restored exactly is refused before any change"
+rm -rf "$D" "$T/svc"/*; touch "$T/svc/will_start"; echo linked > "$T/svc/fp_base"
+run; rc=$?
+check '[ $rc -ne 0 ] && grep -q "Nothing was changed" "$T/out"' "installer refuses 'linked'"
+check '[ ! -e "$BIN" ] && [ ! -f "$T/svc/masked" ]' "nothing installed, fprintd untouched"
+
+echo "== failure while recording the state rolls the installation back"
+rm -rf "$D" "$T/svc"/*; touch "$T/svc/will_start"
+mkdir -p "$D/var/lib"; echo "not a directory" > "$D/var/lib/cros-fprintd"
+run; rc=$?
+check '[ $rc -ne 0 ] && grep -q "restoring the previous state" "$T/out"' "installer fails and rolls back"
+check '[ ! -e "$BIN" ] && [ ! -e "$UNIT" ] && [ ! -f "$T/svc/masked" ]' "no half-finished installation remains"
 
 echo "RESULT: $([ $FAILED -eq 0 ] && echo "ALL PASSED" || echo FAILED)"
 exit $FAILED
