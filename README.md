@@ -28,6 +28,16 @@ The installer checks these and refuses to install otherwise:
 - ✅ Enrolment and verification, `sudo`, the GNOME lock screen, fingerprint after suspend.
 - Untested: polkit prompts, and fingerprint settings in GNOME Settings.
 
+## Similar projects
+
+| Project | Approach | Use it if |
+|---|---|---|
+| **This project** | Takes the place of the `fprintd` service with the same D-Bus interface. The stock PAM module, GNOME and the `fprintd-*` tools work unchanged; nothing needs to be compiled | you have a Kohaku and use GNOME |
+| [libfprint `crfpmoc` driver](https://gitlab.freedesktop.org/libfprint/libfprint/-/merge_requests/512) | A proposed driver for libfprint itself (merge requests !493 and !512). The stock `fprintd` keeps running, so other readers keep working | it's in your distribution's libfprint, or you're willing to build libfprint from source |
+| [rust-fp](https://github.com/ChocolateLoverRaj/rust-fp) | Its own library, D-Bus service and PAM module, written in Rust | you use KDE Plasma; GNOME isn't supported |
+
+Once the libfprint driver ships in your distribution's libfprint, it's the better long-term choice: it's maintained upstream and doesn't replace `fprintd`.
+
 ## Install
 
 ```bash
