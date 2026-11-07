@@ -87,6 +87,7 @@ sudo ./install.sh --uninstall --purge   # also deletes them
 ## Troubleshooting
 
 - **Logs:** `journalctl -u cros-fprintd -b`
+- **The fingerprint option disappears now and then:** the [availability monitor](https://github.com/greedgoddess/kohaku-fprintd-daemon/tree/main/tools/monitor) (a development tool in the repository, not in the release) records when it happens and what state the service and MCU were in.
 - **The installer reports a failed requirement:** each line says what's missing. The usual fix is a firmware update, or switching back to s2idle if you changed the sleep mode.
 - **The reader stopped working after a suspend:** check `cat /sys/power/mem_sleep`. If `deep` is selected, that's the unsupported S3 mode. A full power-off brings the reader back.
 - **The lock screen doesn't offer fingerprint:** check that `gsettings get org.gnome.login-screen enable-fingerprint-authentication` prints `true` (enabling `with-fingerprint` in PAM sets it), and log out and back in once. Press a key on the lock screen first, so the password field shows.
@@ -138,6 +139,7 @@ So the lock screen asks the daemon about the reader, while the login screen neve
 | `scripts/make-release.sh` | builds the release tarball |
 | `tests/` | D-Bus API tests against a simulated MCU |
 | `tools/fpprobe/` | small C programs used to work out the MCU protocol |
+| `tools/monitor/` | availability monitor that logs when and why the reader becomes unavailable |
 | `docs/SUSPEND-INVESTIGATION.md` | the S3 investigation, and its resolution with firmware 2609.3 |
 
 ### Working on it
@@ -152,6 +154,7 @@ So the lock screen asks the daemon about the reader, while the login screen neve
   ```
 
 - `tools/fpprobe/` contains probes for talking to the MCU by hand. See its README for which ones change the MCU's state.
+- `tools/monitor/` contains an availability monitor: a small service that logs state changes, suspend/resume and relevant journal lines, plus a `mark` command to note when something went wrong.
 
 ### Releasing
 

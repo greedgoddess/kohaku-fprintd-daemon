@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Monitor availability of the cros-fprintd fingerprint service
+After=cros-fprintd.service dbus.service
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/libexec/cros-fprintd-monitor run
+Restart=on-failure
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
