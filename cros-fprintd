@@ -23,8 +23,7 @@ Access rule (instead of polkit): a caller may act for a user if it runs as that
 user or as root. pam_fprintd under sudo/gdm runs as root; GNOME Settings runs as
 the user. Template files never leave the machine and are only readable by root.
 
-Dev options: --session-bus and --fake-mcu run the service without hardware or
-root, for trying the D-Bus side.
+Tests run it on a private session bus with a simulated MCU: see tests/fake_daemon.py.
 """
 import argparse
 import errno
@@ -72,8 +71,11 @@ EV_MATCH = 1 << 28
 SEED_STRUCT_VERSION = 4
 TEMPLATE_COMMIT = 0x80000000
 CHUNK = 512
+MAX_FAILED_MATCHES = 5                     # consecutive failures before a lockout
+LOCKOUT_SECONDS = 600                      # fingerprint refused for 10 minutes after that
 ENROLL_STAGES = 12                         # estimate; GNOME uses it for its progress ring
 
+BUS_TYPE = Gio.BusType.SYSTEM            # the test harness switches this to SESSION
 BUS_NAME = "net.reactivated.Fprint"
 MGR_PATH = "/net/reactivated/Fprint/Manager"
 DEV_PATH = "/net/reactivated/Fprint/Device/0"
@@ -230,60 +232,6 @@ class Mcu:
         return None
 
 
-class FakeMcu:
-    """In-memory stand-in for development without hardware (--fake-mcu)."""
-
-    def __init__(self):
-        self.mode = 0
-        self.templates = []
-        self.dirty = 0
-        self.progress = 0
-        self.matches = 0
-        self.seed_set = False
-
-    def ensure_seed(self, seed, seed_is_new):
-        self.seed_set = True
-
-    def set_context(self, userid):
-        self.templates, self.dirty, self.progress = [], 0, 0
-
-    def info(self):
-        return {"template_size": 64, "max": 5, "valid": len(self.templates), "dirty": self.dirty}
-
-    def load_template(self, blob):
-        self.templates.append(blob)
-
-    def read_template(self, index):
-        self.dirty = 0
-        return (b"FAKE-TEMPLATE-%d-" % index + b"x" * 64)[:64]
-
-    def set_mode(self, mode):
-        self.mode = mode
-
-    def drain_events(self):
-        pass
-
-    def wait_event(self, timeout):
-        time.sleep(min(timeout, 0.15))
-        if self.mode & (1 << 5):                       # ENROLL_IMAGE armed
-            self.mode &= ~(1 << 5)
-            self.progress = min(100, self.progress + 9)
-            if self.progress >= 100:
-                self.templates.append(b"fake")
-                self.mode = 0
-                self.progress = 0
-                return EV_ENROLL | (100 << 4)
-            return EV_ENROLL | (self.progress << 4) | (2 if self.progress % 3 == 0 else 0)
-        if self.mode & (1 << 6):                       # MATCH armed
-            self.mode &= ~(1 << 6)
-            self.matches += 1
-            if self.matches % 2 == 1 or not self.templates:
-                return EV_MATCH | (0xF << 12)          # no match
-            self.dirty = 1
-            return EV_MATCH | 3                        # match, template updated, index 0
-        return None
-
-
 # ------------------------------------------------------------------ storage --
 def atomic_write(path, data):
     tmp = f"{path}.tmp"
@@ -364,6 +312,36 @@ class Store:
 
 
 # ------------------------------------------------------------------ service --
+class Lockout:
+    """Refuse fingerprint verification for a while after repeated failed matches.
+
+    Kept in memory only; the password always remains available.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._failures = {}
+        self._until = {}
+
+    def locked(self, user):
+        with self._lock:
+            return time.monotonic() < self._until.get(user, 0)
+
+    def failed(self, user):
+        with self._lock:
+            n = self._failures.get(user, 0) + 1
+            self._failures[user] = n
+            if n >= MAX_FAILED_MATCHES:
+                self._failures[user] = 0
+                self._until[user] = time.monotonic() + LOCKOUT_SECONDS
+                log.warning("%d failed matches for %s: fingerprint locked for %d s",
+                            n, user, LOCKOUT_SECONDS)
+
+    def succeeded(self, user):
+        with self._lock:
+            self._failures.pop(user, None)
+
+
 class Session:
     def __init__(self, kind):
         self.kind = kind                      # "verify" or "enroll"
@@ -382,6 +360,7 @@ class Service:
         self.user = None
         self.session = None
         self.finger_needed = False
+        self.lockout = Lockout()
 
     # -- helpers ----------------------------------------------------------
     def _emit(self, signal, fmt, args):
@@ -506,6 +485,8 @@ class Service:
             raise FprintError("InvalidFingername", "Invalid finger name")
         if not self.store.fingers(self.user):
             raise FprintError("NoEnrolledPrints", "No enrolled prints for user")
+        if self.lockout.locked(self.user):
+            raise FprintError("Internal", "Too many failed attempts; use your password")
         return self._start("verify", self._verify_worker, finger)
 
     def m_EnrollStart(self, sender, args):
@@ -559,9 +540,12 @@ class Service:
                     name = loaded[idx] if idx < len(loaded) else None
                     ok = finger == "any" or name == finger
                     log.info("match for %s: %s", user, name)
+                    (self.lockout.succeeded if ok else self.lockout.failed)(user)
                     self._emit("VerifyStatus", "(sb)", ("verify-match" if ok else "verify-no-match", True))
                     return
                 if err == 0:
+                    log.info("no match for %s", user)
+                    self.lockout.failed(user)
                     self._emit("VerifyStatus", "(sb)", ("verify-no-match", True))
                     return
                 if err in (2, 4):                     # low quality / low coverage
@@ -679,9 +663,10 @@ class Service:
                 log.warning("refused %s from %s: %s (%s)", method, self._who(sender),
                             e.name.rsplit(".", 1)[-1], e)
             invocation.return_dbus_error(e.name, str(e))
-        except Exception as e:                        # noqa: BLE001
+        except Exception:                             # noqa: BLE001
+            # details go to the journal only, not to (possibly unprivileged) callers
             log.exception("method %s failed", method)
-            invocation.return_dbus_error(ERR + "Internal", str(e))
+            invocation.return_dbus_error(ERR + "Internal", "Internal error, see the system journal")
 
     def manager_call(self, conn, sender, path, iface, method, params, invocation):
         if log.isEnabledFor(logging.DEBUG):
@@ -699,8 +684,6 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--device", default="/dev/cros_fp")
     ap.add_argument("--state-dir", default="/var/lib/cros-fprintd")
-    ap.add_argument("--session-bus", action="store_true", help="dev: use the session bus")
-    ap.add_argument("--fake-mcu", action="store_true", help="dev: no hardware, simulated MCU")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -708,7 +691,7 @@ def main():
 
     store = Store(args.state_dir)
     try:
-        mcu = FakeMcu() if args.fake_mcu else Mcu(args.device)
+        mcu = Mcu(args.device)
     except OSError as e:
         log.error("cannot open %s: %s", args.device, e)
         return 1
@@ -743,7 +726,7 @@ def main():
         lost.append(True)
         loop.quit()
 
-    bus = Gio.BusType.SESSION if args.session_bus else Gio.BusType.SYSTEM
+    bus = BUS_TYPE
     Gio.bus_own_name(bus, BUS_NAME, Gio.BusNameOwnerFlags.NONE, on_bus, on_acquired, on_lost)
     try:
         loop.run()

@@ -23,7 +23,7 @@ Run them as root, or as a user in the group that owns `/dev/cros_fp` (`plugdev` 
 
 Notes:
 
-- **One seed per boot.** The MCU accepts one seed per boot. If you run `fpprobe3` and later install the daemon in the same boot, pass `seed.bin` to `install.sh`, or reboot first.
+- **One seed per boot.** The MCU accepts one seed per boot. If you run `fpprobe3`, reboot before installing or starting the daemon. Otherwise the MCU keeps the probe's seed until the next reboot, and the daemon can't decrypt saved fingers.
 - **The test user id is not the daemon's.** `fpprobe3` uses a fixed test user id, so templates saved with `fpprobe8` can't be loaded by the daemon, which derives a different id per user.
 - **Treat the files as secrets.** `seed.bin` and `template0.bin` are sensitive. They're written with mode 0600; delete them when you're done.
 
