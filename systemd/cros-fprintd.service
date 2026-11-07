@@ -17,10 +17,12 @@ StateDirectory=cros-fprintd
 StateDirectoryMode=0700
 UMask=0077
 
-# Filesystem: read-only system, no home directories, private /tmp
+# Filesystem: read-only system, no home directories, private /tmp, own processes only in /proc
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
+ProtectProc=invisible
+ProcSubset=pid
 
 # Kernel and system settings it never needs to touch
 ProtectKernelTunables=yes
@@ -34,9 +36,12 @@ ProtectHostname=yes
 DevicePolicy=closed
 DeviceAllow=/dev/cros_fp rw
 
-# No network; only Unix sockets (D-Bus)
+# No network; only Unix sockets (D-Bus); no System V IPC or kernel keyring sharing
 PrivateNetwork=yes
+IPAddressDeny=any
 RestrictAddressFamilies=AF_UNIX
+PrivateIPC=yes
+KeyringMode=private
 
 # Privileges: runs as root for D-Bus policy and file ownership, but without capabilities
 NoNewPrivileges=yes
@@ -45,6 +50,8 @@ RestrictSUIDSGID=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
 LockPersonality=yes
+# No memory that is both writable and executable (tested with the GObject bindings)
+MemoryDenyWriteExecute=yes
 
 # System calls: the usual set for system services; others fail with EPERM
 SystemCallArchitectures=native
