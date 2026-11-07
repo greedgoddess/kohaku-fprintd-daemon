@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""
+cros-fprintd-monitor - record when (and hints why) the fingerprint reader is unavailable
+
+Writes one compact timeline to /var/log/cros-fprintd-monitor.log:
+
+  STATE    a snapshot, logged at start and whenever something changes:
+           service state/restarts, D-Bus name owner, API answer, /dev/cros_fp,
+           MCU hello, seed/mode, sleep mode
+  EVENT    suspend / resume (with S0ix residency gained during the sleep)
+  JOURNAL  journal lines that matter: cros-fprintd, pam_fprintd, cros-ec errors,
+           GNOME Shell / GDM fingerprint messages, suspend entry/exit
+  MARK     your own note ("sudo had no fingerprint"), plus a snapshot
+
+Only read-only commands are sent to the MCU (hello, mode query, encryption status).
+
+Usage:
+  cros-fprintd-monitor run              (the systemd service runs this)
+  sudo cros-fprintd-monitor status      print one snapshot now
+  sudo cros-fprintd-monitor mark [TEXT] add a marker to the log, with a snapshot
+"""
+import fcntl
+import os
+import re
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+import gi
+
+gi.require_version("Gio", "2.0")
+gi.require_version("GLib", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+LOG = "/var/log/cros-fprintd-monitor.log"
+LOG_MAX = 2 * 1024 * 1024          # rotate to .1 above 2 MB
+INTERVAL = 60                      # seconds between snapshots
+HEARTBEAT = 3600                   # log an unchanged snapshot at least this often
+DEV = "/dev/cros_fp"
+IOCXCMD = 0xC014EC00
+S0IX = "/sys/kernel/debug/pmc_core/slp_s0_residency_usec"
+
+JOURNAL_RE = re.compile(
+    r"cros-fprintd|pam_fprintd|fprint|fingerprint|cros-ec|cros_ec|EC failed to respond|"
+    r"sleep transition|PM: suspend (entry|exit)|net\.reactivated\.Fprint", re.I)
+
+_lock = threading.Lock()
+
+
+# ------------------------------------------------------------------ output --
+def log(kind, text):
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {kind:<7} {text}\n"
+    with _lock:
+        try:
+            if os.path.exists(LOG) and os.path.getsize(LOG) > LOG_MAX:
+                os.replace(LOG, LOG + ".1")
+            with open(LOG, "a") as f:
+                f.write(line)
+        except OSError as e:
+            sys.stderr.write(f"cannot write {LOG}: {e}\n")
+
+
+# ---------------------------------------------------------------- probing --
+def ec(fd, cmd, data=b"", insize=0, ver=0):
+    n = max(len(data), insize)
+    buf = bytearray(struct.pack("<5I", ver, cmd, len(data), insize, 0) + data.ljust(n, b"\0"))
+    ret = fcntl.ioctl(fd, IOCXCMD, buf, True)
+    return struct.unpack_from("<I", buf, 16)[0], bytes(buf[20:20 + max(ret, 0)])
+
+
+def probe_mcu():
+    """Read-only checks of the MCU. Returns a dict of short strings."""
+    out = {"dev": "yes" if os.path.exists(DEV) else "MISSING"}
+    if out["dev"] != "yes":
+        return out
+    try:
+        fd = os.open(DEV, os.O_RDWR)
+    except OSError as e:
+        out["mcu"] = f"open-error:{e.errno}"
+        return out
+    try:
+        res, d = ec(fd, 0x0001, struct.pack("<I", 0xA0B0C0D0), 4)          # HELLO
+        ok = res == 0 and len(d) == 4 and struct.unpack("<I", d)[0] == 0xA1B2C3D4
+        out["mcu"] = "ok" if ok else f"bad-hello:{res}"
+        if ok:
+            res, d = ec(fd, 0x0409, b"", 8)                                # FP_ENC_STATUS
+            if res == 0 and len(d) == 8:
+                out["seed"] = str(struct.unpack("<II", d)[1] & 1)
+            res, d = ec(fd, 0x0402, struct.pack("<I", 0x80000000), 4)      # FP_MODE get
+            if res == 0 and len(d) == 4:
+                out["mode"] = hex(struct.unpack("<I", d)[0])
+    except OSError as e:
+        out["mcu"] = "TIMEOUT" if e.errno == 110 else f"ioctl-error:{e.errno}"
+    finally:
+        os.close(fd)
+    return out
+
+
+def probe_service():
+    out = {}
+    try:
+        r = subprocess.run(["systemctl", "show", "cros-fprintd", "-p", "ActiveState",
+                            "-p", "SubState", "-p", "NRestarts", "-p", "MainPID"],
+                           capture_output=True, text=True, timeout=5)
+        kv = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+        out["svc"] = f"{kv.get('ActiveState', '?')}/{kv.get('SubState', '?')}"
+        out["pid"] = kv.get("MainPID", "?")
+        out["restarts"] = kv.get("NRestarts", "?")
+    except (OSError, subprocess.SubprocessError) as e:
+        out["svc"] = f"error:{e.__class__.__name__}"
+    return out
+
+
+def probe_dbus(bus):
+    out = {}
+    if bus is None:
+        return {"bus": "no-system-bus"}
+    try:
+        r = bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                          "GetNameOwner", GLib.Variant("(s)", ("net.reactivated.Fprint",)),
+                          GLib.VariantType("(s)"), Gio.DBusCallFlags.NONE, 2000, None)
+        out["bus"] = r.unpack()[0]
+    except GLib.Error:
+        out["bus"] = "NO-OWNER"
+        return out
+    try:
+        bus.call_sync("net.reactivated.Fprint", "/net/reactivated/Fprint/Manager",
+                      "net.reactivated.Fprint.Manager", "GetDefaultDevice", None,
+                      GLib.VariantType("(o)"), Gio.DBusCallFlags.NO_AUTO_START, 3000, None)
+        out["api"] = "ok"
+    except GLib.Error as e:
+        name = Gio.DBusError.get_remote_error(e) or e.message
+        out["api"] = "TIMEOUT" if "Timeout" in str(name) or "timed out" in e.message else f"error:{name}"
+    return out
+
+
+def read_first(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def sleep_mode():
+    m = re.search(r"\[(\w+)\]", read_first("/sys/power/mem_sleep"))
+    return m.group(1) if m else "?"
+
+
+def s0ix_usec():
+    v = read_first(S0IX)
+    return int(v) if v.isdigit() else None
+
+
+def snapshot(bus):
+    s = {}
+    s.update(probe_service())
+    s.update(probe_dbus(bus))
+    s.update(probe_mcu())
+    s["sleep"] = sleep_mode()
+    problems = []
+    if not s.get("svc", "").startswith("active/running"):
+        problems.append("service-not-running")
+    if s.get("bus") in ("NO-OWNER", "no-system-bus"):
+        problems.append("no-dbus-owner")
+    elif s.get("api") != "ok":
+        problems.append("api-not-answering")
+    if s.get("dev") != "yes":
+        problems.append("no-device-node")
+    elif s.get("mcu") != "ok":
+        problems.append("mcu-not-answering")
+    if s["sleep"] != "s2idle":
+        problems.append("sleep-mode-not-s2idle")
+    s["avail"] = "yes" if not problems else "NO(" + ",".join(problems) + ")"
+    return s
+
+
+def fmt(s):
+    order = ["avail", "svc", "pid", "restarts", "bus", "api", "dev", "mcu", "seed", "mode", "sleep"]
+    return " ".join(f"{k}={s[k]}" for k in order if k in s)
+
+
+# ------------------------------------------------------------------- agent --
+class Agent:
+    STABLE = ("avail", "svc", "pid", "restarts", "bus", "api", "dev", "mcu", "seed", "mode", "sleep")
+
+    def __init__(self):
+        try:
+            self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        except GLib.Error as e:
+            log("ERROR", f"no system bus: {e.message}")
+            self.bus = None
+        self.last = None
+        self.last_logged = 0.0
+        self.s0ix_before_sleep = None
+
+    def check(self, reason="poll"):
+        s = snapshot(self.bus)
+        key = tuple(s.get(k) for k in self.STABLE)
+        now = time.monotonic()
+        if self.last is None or key != self.last or now - self.last_logged > HEARTBEAT:
+            tag = "" if reason == "poll" else f"[{reason}] "
+            if self.last is not None and key != self.last:
+                old = dict(zip(self.STABLE, self.last))
+                changed = [k for k in self.STABLE if old.get(k) != s.get(k)]
+                tag += "changed:" + ",".join(changed) + " "
+            log("STATE", tag + fmt(s))
+            self.last, self.last_logged = key, now
+        return True
+
+    def on_prepare_for_sleep(self, conn, sender, path, iface, signal, params):
+        going_down = params.unpack()[0]
+        if going_down:
+            self.s0ix_before_sleep = s0ix_usec()
+            log("EVENT", f"suspend (sleep mode {sleep_mode()})")
+        else:
+            after = s0ix_usec()
+            gained = ""
+            if after is not None and self.s0ix_before_sleep is not None:
+                gained = f", S0ix gained {(after - self.s0ix_before_sleep) / 1e6:.1f} s"
+            log("EVENT", "resume" + gained)
+            for delay in (3, 15, 60):
+                GLib.timeout_add_seconds(delay, self._once, f"resume+{delay}s")
+
+    def _once(self, reason):
+        self.check(reason)
+        return False
+
+    def follow_journal(self):
+        try:
+            p = subprocess.Popen(["journalctl", "-f", "-n", "0", "-o", "short-iso"],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except OSError as e:
+            log("ERROR", f"cannot follow journal: {e}")
+            return
+        for line in p.stdout:
+            if JOURNAL_RE.search(line) and "cros-fprintd-monitor" not in line:
+                log("JOURNAL", line.rstrip()[:400])
+
+    def run(self):
+        if os.path.isdir("/sys/kernel/debug") and not os.path.exists(S0IX):
+            subprocess.run(["mount", "-t", "debugfs", "none", "/sys/kernel/debug"],
+                           stderr=subprocess.DEVNULL)
+        log("START", f"monitor started, polling every {INTERVAL} s")
+        self.check("start")
+        if self.bus is not None:
+            self.bus.signal_subscribe("org.freedesktop.login1", "org.freedesktop.login1.Manager",
+                                      "PrepareForSleep", "/org/freedesktop/login1", None,
+                                      Gio.DBusSignalFlags.NONE, self.on_prepare_for_sleep)
+        threading.Thread(target=self.follow_journal, daemon=True).start()
+        GLib.timeout_add_seconds(INTERVAL, self.check)
+        GLib.MainLoop().run()
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd == "run":
+        Agent().run()
+    elif cmd == "status":
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        except GLib.Error:
+            bus = None
+        print(fmt(snapshot(bus)))
+    elif cmd == "mark":
+        text = " ".join(sys.argv[2:]) or "(no text)"
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        except GLib.Error:
+            bus = None
+        s = snapshot(bus)
+        log("MARK", text)
+        log("STATE", "[mark] " + fmt(s))
+        print("marked:", fmt(s))
+    else:
+        print(__doc__)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
