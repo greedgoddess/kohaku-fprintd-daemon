@@ -6,7 +6,7 @@ The first part of this README is for installing and using it. The [Development](
 
 ## Read this first
 
-**This is experimental software (version 0.8). Use it with caution.**
+**This is experimental, pre-1.0 software. Use it with caution.** The exact version is in the `VERSION` file of each release.
 
 - **Built for one laptop.** It was made for, and tested on, exactly one machine: the author's Samsung Galaxy Chromebook (Kohaku) with MrChromebox firmware 2609.3, Fedora 45 and GNOME Shell 51. The installer refuses anything outside that configuration, and even within it, your machine may behave differently.
 - **Not regularly maintained.** This is a personal project, published in case it helps someone. There is no promise of updates, fixes or answers to issues and pull requests. Fedora, GNOME or firmware updates may break it at any time. You're welcome to fork it; it's MIT-licensed.
@@ -156,6 +156,9 @@ So the lock screen asks the daemon about the reader, while the login screen neve
   - **D-Bus API:** the main suite;
   - **lockout;**
   - **invalid match index;**
+  - **worker lifetime:** a released session keeps the device busy until its worker has ended;
+  - **delete during verify:** a print deleted mid-verify neither matches nor comes back;
+  - **installer:** refusal of unsupported setups, rollback on a failed fresh install and on a failed upgrade, uninstall keeping foreign drop-ins, `--purge`. It runs in a temporary directory with stubbed `systemctl`;
   - **unsafe seed:** a world-readable seed must be refused.
 
   The simulated MCU lives in `tests/fake_daemon.py`, which loads the daemon and swaps in the fake. The shipped daemon itself contains no test hooks.

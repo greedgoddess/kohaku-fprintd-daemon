@@ -340,14 +340,29 @@ class Store:
     def fingers(self, user):
         """Enrolled finger names in MCU load order."""
         d = self._dir(user)
+        path = os.path.join(d, "fingers.json")
         try:
-            order = json.loads(read_private(os.path.join(d, "fingers.json"), 4096))["order"]
+            data = json.loads(read_private(path, 4096))
         except FileNotFoundError:
             return []
-        except (ValueError, KeyError, TypeError, PermissionError) as e:
-            log.error("ignoring fingers.json of %s: %s", user, e)
+        except (ValueError, PermissionError) as e:        # JSONDecodeError is a ValueError
+            log.error("ignoring %s: %s", path, e)
             return []
-        return [x for x in order if x in FINGERS and os.path.exists(os.path.join(d, x + ".bin"))]
+        order = data.get("order") if isinstance(data, dict) else None
+        if not isinstance(order, list) or not all(isinstance(x, str) for x in order):
+            log.error("ignoring %s: expected {\"order\": [finger names]}", path)
+            return []
+        result = []
+        for name in order:
+            if name not in FINGERS:
+                log.warning("%s: ignoring unknown finger name %r", path, name)
+            elif name in result:
+                log.warning("%s: ignoring duplicate entry %r", path, name)
+            elif not os.path.exists(os.path.join(d, name + ".bin")):
+                log.warning("%s: template for %r is missing", path, name)
+            else:
+                result.append(name)
+        return result
 
     def read_finger(self, user, finger):
         return read_private(os.path.join(self._dir(user), finger + ".bin"), MAX_TEMPLATE_BYTES)
@@ -619,6 +634,10 @@ class Service:
                         log.warning("MCU reported a match for invalid template index %d", idx)
                         self.lockout.failed(user)
                         self._emit("VerifyStatus", "(sb)", ("verify-unknown-error", True))
+                        return
+                    if self.store.generation(user) != generation:
+                        log.warning("ignoring match for %s: fingers were deleted during verify", user)
+                        self._emit("VerifyStatus", "(sb)", ("verify-no-match", True))
                         return
                     name = loaded[idx]
                     ok = finger in ("any", name)

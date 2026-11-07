@@ -5,7 +5,8 @@
     tests/fake_daemon.py --state-dir /tmp/x [-v]
 
 FAKE_NEVER_MATCH=1 makes every match attempt fail (lockout test);
-FAKE_MATCH_INDEX=n reports every attempt as a match for template index n (invalid-index test).
+FAKE_MATCH_INDEX=n reports every attempt as a match for template index n (invalid-index test);
+FAKE_LOAD_DELAY=s makes every template load take s seconds (concurrency and deletion tests).
 Not installed and not part of the release: the shipped daemon has no test hooks.
 """
 import importlib.machinery
@@ -23,6 +24,7 @@ _loader.exec_module(daemon)
 EV_ENROLL, EV_MATCH = daemon.EV_ENROLL, daemon.EV_MATCH
 NEVER_MATCH = os.environ.get("FAKE_NEVER_MATCH") == "1"
 MATCH_INDEX = os.environ.get("FAKE_MATCH_INDEX")      # always report a match with this index
+LOAD_DELAY = float(os.environ.get("FAKE_LOAD_DELAY", "0"))  # seconds per template load
 
 
 class FakeMcu:
@@ -46,6 +48,7 @@ class FakeMcu:
         return {"template_size": 64, "max": 5, "valid": len(self.templates), "dirty": self.dirty}
 
     def load_template(self, blob):
+        time.sleep(LOAD_DELAY)
         self.templates.append(blob)
 
     def read_template(self, index):

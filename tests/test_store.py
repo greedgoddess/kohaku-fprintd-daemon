@@ -77,5 +77,36 @@ with tempfile.TemporaryDirectory() as tmp:
     os.symlink(users + ".real", users)
     check(raises(PermissionError, lambda: d.Store(root)), "users directory that is a symlink is refused")
 
+with tempfile.TemporaryDirectory() as tmp:
+    # atomic_write: large data written completely, no temp files left, file private
+    path = os.path.join(tmp, "big")
+    data = os.urandom(3 * 1024 * 1024 + 17)
+    d.atomic_write(path, data)
+    with open(path, "rb") as f:
+        check(f.read() == data, "atomic_write writes large data completely")
+    check(os.stat(path).st_mode & 0o777 == 0o600, "atomic_write creates a 0600 file")
+    check(os.listdir(tmp) == ["big"], "atomic_write leaves no temporary files")
+
+    # fingers.json validation
+    store = d.Store(os.path.join(tmp, "state"))
+    udir = os.path.join(tmp, "state", "users", "bob")
+    os.makedirs(udir, mode=0o700)
+    for name in ("right-thumb", "left-thumb"):
+        d.atomic_write(os.path.join(udir, name + ".bin"), b"t" * 64)
+
+    def with_json(text):
+        d.atomic_write(os.path.join(udir, "fingers.json"), text.encode())
+        return store.fingers("bob")
+
+    check(with_json('{"order": ["right-thumb", "left-thumb"]}') == ["right-thumb", "left-thumb"],
+          "valid fingers.json is read in order")
+    check(with_json("not json") == [], "malformed JSON is ignored")
+    check(with_json('{"order": "right-thumb"}') == [], "order given as a string is rejected")
+    check(with_json('{"order": {"right-thumb": 1}}') == [], "order given as an object is rejected")
+    check(with_json('["right-thumb"]') == [], "top level that isn't an object is rejected")
+    check(with_json('{"order": ["right-thumb", 5]}') == [], "non-string entries are rejected")
+    check(with_json('{"order": ["right-thumb", "nose", "right-thumb", "left-index-finger", "left-thumb"]}')
+          == ["right-thumb", "left-thumb"], "unknown, duplicate and missing fingers are skipped")
+
 print("RESULT:", "FAILED" if failed else "ALL PASSED")
 sys.exit(1 if failed else 0)

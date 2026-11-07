@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
-# Run all tests: storage unit tests, then D-Bus API tests against a simulated MCU on a
-# private session bus. No hardware and no root needed.  Usage:  tests/run-fake-tests.sh
+# Run all tests: storage unit tests, D-Bus tests against a simulated MCU on a private
+# session bus, and installer tests in a temporary directory. No hardware and no root needed.  Usage:  tests/run-fake-tests.sh
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ "${CROS_FPRINTD_TEST_INNER:-}" != 1 ]; then
@@ -55,6 +55,11 @@ python3 "$HERE/test_store.py" || RC=1
 run_suite "D-Bus API"      "$TMP/s1" test_fake_dbus.py
 run_suite "lockout"        "$TMP/s2" test_lockout.py FAKE_NEVER_MATCH=1
 run_suite "invalid index"  "$TMP/s3" test_bad_index.py FAKE_MATCH_INDEX=9
+run_suite "worker lifetime" "$TMP/s5" test_concurrency.py FAKE_LOAD_DELAY=3
+run_suite "delete during verify" "$TMP/s6" test_delete_race.py FAKE_MATCH_INDEX=0 FAKE_LOAD_DELAY=2
+
+echo "---- installer"
+bash "$HERE/test_installer.sh" || RC=1
 
 echo "---- unsafe seed file"
 mkdir -m 0700 "$TMP/s4" && head -c 32 /dev/urandom > "$TMP/s4/seed" && chmod 0644 "$TMP/s4/seed"

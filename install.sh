@@ -17,15 +17,18 @@ set -euo pipefail
 
 MIN_FW="2609.3"
 R="${FPRINTD_CHECK_ROOT:-}"   # path prefix for testing the checks; empty in real use
+D="${FPRINTD_DESTDIR:-}"      # path prefix for testing install/uninstall; empty in real use
 
-[ "$(id -u)" -eq 0 ] || [ -n "$R" ] || exec sudo "$0" "$@"
+[ "$(id -u)" -eq 0 ] || [ -n "$R" ] || [ -n "$D" ] || exec sudo "$0" "$@"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN=/usr/local/libexec/cros-fprintd
-UNIT=/etc/systemd/system/cros-fprintd.service
-DROPIN_DIR=/etc/systemd/system/cros-fprintd.service.d
-UDEV_RULE=/etc/udev/rules.d/70-cros-fprintd.rules
-STATE=/var/lib/cros-fprintd
+BIN=$D/usr/local/libexec/cros-fprintd
+UNIT=$D/etc/systemd/system/cros-fprintd.service
+DROPIN_DIR=$D/etc/systemd/system/cros-fprintd.service.d
+UDEV_RULE=$D/etc/udev/rules.d/70-cros-fprintd.rules
+STATE=$D/var/lib/cros-fprintd
+OWNER=()
+[ "$(id -u)" -ne 0 ] || OWNER=(-o root -g root)
 
 FAILED=0
 ok()  { printf '  [ok]   %s\n' "$*"; }
@@ -147,7 +150,7 @@ for f in cros-fprintd systemd/cros-fprintd.service udev/70-cros-fprintd.rules; d
 done
 
 check_all
-[ -z "$R" ] || { echo "(test mode: stopping before installing)"; exit 0; }
+[ -z "$R" ] || [ -n "$D" ] || { echo "(test mode: stopping before installing)"; exit 0; }
 
 dnf install -y fprintd fprintd-pam python3-gobject
 
@@ -188,9 +191,9 @@ rollback() {
 set -E
 trap rollback ERR
 
-install -D -o root -g root -m 0755 "$HERE/cros-fprintd" "$BIN"
-install -D -o root -g root -m 0644 "$HERE/systemd/cros-fprintd.service" "$UNIT"
-install -D -o root -g root -m 0644 "$HERE/udev/70-cros-fprintd.rules" "$UDEV_RULE"
+install -D "${OWNER[@]}" -m 0755 "$HERE/cros-fprintd" "$BIN"
+install -D "${OWNER[@]}" -m 0644 "$HERE/systemd/cros-fprintd.service" "$UNIT"
+install -D "${OWNER[@]}" -m 0644 "$HERE/udev/70-cros-fprintd.rules" "$UDEV_RULE"
 udevadm control --reload-rules
 # Older versions stopped the daemon before suspend (for S3); with s2idle it must keep running.
 rm -f "$DROPIN_DIR/stop-on-suspend.conf"
