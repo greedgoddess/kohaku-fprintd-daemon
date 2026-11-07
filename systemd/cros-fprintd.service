@@ -7,17 +7,49 @@ After=dbus.service
 [Service]
 Type=dbus
 BusName=net.reactivated.Fprint
-ExecStart=/usr/bin/python3 /usr/local/libexec/cros-fprintd
-StateDirectory=cros-fprintd
-StateDirectoryMode=0700
+# -I: isolated mode, ignores PYTHON* variables and user site-packages
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/cros-fprintd
 Restart=on-failure
 RestartSec=3
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectHome=yes
+
+# State: /var/lib/cros-fprintd, private to root
+StateDirectory=cros-fprintd
+StateDirectoryMode=0700
+UMask=0077
+
+# Filesystem: read-only system, no home directories, private /tmp
 ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+# Kernel and system settings it never needs to touch
+ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# Devices: only the fingerprint MCU
+DevicePolicy=closed
+DeviceAllow=/dev/cros_fp rw
+
+# No network; only Unix sockets (D-Bus)
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+
+# Privileges: runs as root for D-Bus policy and file ownership, but without capabilities
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+# System calls: the usual set for system services; others fail with EPERM
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

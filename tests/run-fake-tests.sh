@@ -9,11 +9,18 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] || [ "${CROS_FPRINTD_TEST_INNER:-}" !=
 fi
 STATE="$(mktemp -d)"
 LOG="$STATE/daemon.log"
-python3 "$HERE/../cros-fprintd" --session-bus --fake-mcu --state-dir "$STATE/state" -v 2> "$LOG" &
+python3 "$HERE/fake_daemon.py" --state-dir "$STATE/state" -v 2> "$LOG" &
 DPID=$!
 sleep 1.5
 python3 "$HERE/test_fake_dbus.py" "$STATE/state"
 RC=$?
+kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null
+
+echo "---- lockout test"
+FAKE_NEVER_MATCH=1 python3 "$HERE/fake_daemon.py" --state-dir "$STATE/state2" -v 2>> "$LOG" &
+DPID=$!
+sleep 1.5
+python3 "$HERE/test_lockout.py" || RC=1
 kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null
 echo "---- daemon log ($LOG)"; cat "$LOG"
 rm -rf "$STATE"

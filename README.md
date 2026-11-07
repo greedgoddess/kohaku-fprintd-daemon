@@ -53,12 +53,14 @@ Update your firmware first, if needed, with the [MrChromebox Firmware Utility Sc
 
 ```bash
 curl -LO https://github.com/greedgoddess/kohaku-fprintd-daemon/releases/latest/download/kohaku-fprintd.tar.gz
+curl -LO https://github.com/greedgoddess/kohaku-fprintd-daemon/releases/latest/download/kohaku-fprintd.tar.gz.sha256
+sha256sum -c kohaku-fprintd.tar.gz.sha256      # must print "kohaku-fprintd.tar.gz: OK"
 tar -xzf kohaku-fprintd.tar.gz
 cd kohaku-fprintd-*/
 sudo ./install.sh
 ```
 
-Releases are the versions that were tested on the author's laptop. Cloning `main` gives you the current, possibly untested, development state instead.
+The checksum catches a damaged or incomplete download; it comes from the same place as the file, so it doesn't prove who made it. Releases are the versions that were tested on the author's laptop. Cloning `main` gives you the current, possibly untested, development state instead.
 
 To only check whether your laptop qualifies, without installing anything: `sudo ./install.sh --check`.
 
@@ -97,6 +99,8 @@ sudo ./install.sh --uninstall --purge   # also deletes them
 
 - **Fingerprint matching runs on the fingerprint chip itself.** Your fingerprint never leaves it unencrypted.
 - **The encrypted templates and the key material are root-only** under `/var/lib/cros-fprintd`. Anyone with root can read them, which is the same trust model as most Linux fingerprint setups.
+- **After 5 failed matches in a row,** fingerprint is refused for 10 minutes and only the password works.
+- **The service runs sandboxed:** no network, no access to home directories, read-only system files, no special privileges, and no devices other than the fingerprint chip.
 - **Treat it as a convenience unlock,** not a replacement for a strong password. Details are under [Security details](#security-details).
 
 ## Development
@@ -145,7 +149,8 @@ So the lock screen asks the daemon about the reader, while the login screen neve
 
 ### Working on it
 
-- `tests/run-fake-tests.sh` runs the D-Bus API tests against a simulated MCU (`--fake-mcu`) on a private session bus, with no hardware or root needed.
+- `tests/run-fake-tests.sh` runs the D-Bus API tests, including the lockout, against a simulated MCU on a private session bus, with no hardware or root needed. The simulated MCU lives in `tests/fake_daemon.py`, which loads the daemon and swaps in the fake; the shipped daemon itself contains no test hooks.
+- `systemd-analyze security cros-fprintd` shows how well the service is sandboxed. The unit scores about 1.5 ("OK"); without the hardening it's 8.2 ("EXPOSED").
 - `FPRINTD_CHECK_ROOT=/some/fake/root ./install.sh --check` runs the installer's checks against a fake `/sys` tree. That's useful for testing the support checks without the hardware.
 - With `-v`, the daemon logs every D-Bus request with the caller's uid. Refused requests are always logged as warnings. To turn it on for the installed service:
 
@@ -178,6 +183,16 @@ Without the `gh` tool, create the release on GitHub (Releases → Draft a new re
 - ChromeOS uses extra firmware features to authenticate match results to the host (pairing keys, signed matches). This daemon doesn't. It trusts the match events from `/dev/cros_fp`, as `fprintd` trusts its USB readers.
 - Treat fingerprint as a convenience unlock. It has only been tested with one enrolled finger against one other finger. False accept and false reject rates are unknown.
 - Instead of polkit, the access rule is "same user or root". Any local user can claim the reader for themselves, and can therefore block it for others while claimed, as with `fprintd`.
+- **Lockout:** after 5 consecutive failed matches for a user, `VerifyStart` is refused for 10 minutes. The count is kept in memory, so restarting the service resets it. Each attempt takes only about a quarter of a second, so without a limit someone could try many fake fingerprints quickly.
+- **Sandboxing:** the unit follows the approach of the stock `fprintd.service` (strict read-only system, kernel and clock protection, a private state directory, device allow-list) and goes further where this daemon allows it:
+  - **Network:** none (`PrivateNetwork=yes`); only Unix sockets for D-Bus.
+  - **Privileges:** no capabilities at all. It runs as root only because of D-Bus policy and file ownership.
+  - **Devices:** `/dev/cros_fp` is the only device it can open.
+  - **System calls:** limited to `@system-service`; anything else fails with `EPERM`.
+  - **Python:** runs in isolated mode (`python3 -I`), which ignores `PYTHON*` environment variables and user site-packages.
+
+  `MemoryDenyWriteExecute=` is not set, because Python's GObject bindings may need executable memory for callbacks.
+- **Error messages:** unexpected errors are logged to the journal; D-Bus callers only get a generic message, so no file paths or internals leak to unprivileged users.
 
 ### Known limitations
 

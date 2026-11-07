@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 # Install (or remove) cros-fprintd on Fedora.
 #
-#   sudo ./install.sh [SEED_FILE]              check requirements, then install
+#   sudo ./install.sh                          check requirements, then install
 #   sudo ./install.sh --check                  only check the requirements
 #   sudo ./install.sh --uninstall [--purge]    remove (--purge: also seed + templates)
 #
@@ -11,9 +11,8 @@
 #   * MrChromebox UEFI firmware 2609.3 or newer
 #   * suspend-to-idle with working S0ix; deep sleep (S3) is NOT supported
 #
-# SEED_FILE (optional): the MCU accepts one seed per boot. If something else
-# (e.g. the fpprobe3 tool) set a seed since the last boot, pass the file it used,
-# or reboot first.
+# The MCU accepts one encryption seed per boot. If a development tool (fpprobe3)
+# has set one since the last boot, reboot before installing.
 set -euo pipefail
 
 MIN_FW="2609.3"
@@ -140,7 +139,7 @@ case "${1:-}" in
         if check_all; then exit 0; else exit 1; fi ;;
 esac
 
-SEED_SRC="${1:-}"
+[ -z "${1:-}" ] || { echo "unknown option: $1 (use --check or --uninstall)" >&2; exit 2; }
 for f in cros-fprintd systemd/cros-fprintd.service udev/70-cros-fprintd.rules; do
     [ -f "$HERE/$f" ] || { echo "missing $HERE/$f" >&2; exit 1; }
 done
@@ -150,19 +149,9 @@ check_all
 
 dnf install -y fprintd fprintd-pam python3-gobject
 
-install -d -m 0700 "$STATE"
-if [ -n "$SEED_SRC" ]; then
-    [ "$(stat -c %s "$SEED_SRC")" -eq 32 ] || { echo "$SEED_SRC must be exactly 32 bytes" >&2; exit 1; }
-    if [ -e "$STATE/seed" ] && ! cmp -s "$SEED_SRC" "$STATE/seed"; then
-        echo "$STATE/seed already exists and differs from $SEED_SRC - refusing to overwrite." >&2
-        exit 1
-    fi
-    [ -e "$STATE/seed" ] || install -m 0600 "$SEED_SRC" "$STATE/seed"
-fi
-
-install -D -m 0755 "$HERE/cros-fprintd" "$BIN"
-install -D -m 0644 "$HERE/systemd/cros-fprintd.service" "$UNIT"
-install -D -m 0644 "$HERE/udev/70-cros-fprintd.rules" "$UDEV_RULE"
+install -D -o root -g root -m 0755 "$HERE/cros-fprintd" "$BIN"
+install -D -o root -g root -m 0644 "$HERE/systemd/cros-fprintd.service" "$UNIT"
+install -D -o root -g root -m 0644 "$HERE/udev/70-cros-fprintd.rules" "$UDEV_RULE"
 udevadm control --reload-rules
 # Older versions stopped the daemon before suspend (for S3); with s2idle it must keep running.
 rm -f "$DROPIN_DIR/stop-on-suspend.conf"
