@@ -60,7 +60,7 @@ check_static() {
     if [ -n "$flags" ] && (( (flags >> 21) & 1 )); then
         ok "firmware advertises S0ix (FADT Low Power S0 Idle)"
     else
-        bad "firmware does not advertise S0ix (FADT Low Power S0 Idle flag not set)"
+        bad "firmware does not advertise S0ix: enable the S0ix option in the firmware setup (press ESC at boot); firmware updates reset it"
     fi
 
     if ls "$R/sys/bus/acpi/devices/" 2>/dev/null | grep -qiE '^(INT33A1|PNP0D80)'; then

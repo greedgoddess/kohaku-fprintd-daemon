@@ -12,6 +12,8 @@ Writes one compact timeline to /var/log/cros-fprintd-monitor.log:
   JOURNAL  journal lines that matter: cros-fprintd, pam_fprintd, cros-ec errors,
            GNOME Shell / GDM fingerprint messages, suspend entry/exit
   MARK     your own note ("sudo had no fingerprint"), plus a snapshot
+  SLEEP    one line per suspend: duration, battery before/after, power drawn,
+           share of the time spent in S0ix (used by the 'battery' command)
 
 Only read-only commands are sent to the MCU (hello, mode query, encryption status).
 
@@ -19,6 +21,7 @@ Usage:
   cros-fprintd-monitor run              (the systemd service runs this)
   sudo cros-fprintd-monitor status      print one snapshot now
   sudo cros-fprintd-monitor mark [TEXT] add a marker to the log, with a snapshot
+  sudo cros-fprintd-monitor battery     average standby drain and expected standby time
 """
 import fcntl
 import os
@@ -155,6 +158,45 @@ def s0ix_usec():
     return int(v) if v.isdigit() else None
 
 
+def power_supplies():
+    """Return (battery dir or None, list of mains/usb dirs)."""
+    base = "/sys/class/power_supply"
+    bat, ac = None, []
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return None, []
+    for n in names:
+        t = read_first(f"{base}/{n}/type")
+        if t == "Battery" and bat is None:
+            bat = f"{base}/{n}"
+        elif t in ("Mains", "USB"):
+            ac.append(f"{base}/{n}")
+    return bat, ac
+
+
+def battery_state():
+    """Energy now/full in mWh, capacity in %, and whether external power is connected."""
+    bat, ac = power_supplies()
+    if bat is None:
+        return None
+
+    def num(name):
+        v = read_first(f"{bat}/{name}")
+        return int(v) if v.lstrip("-").isdigit() else None
+
+    e_now, e_full = num("energy_now"), num("energy_full")          # uWh
+    if e_now is None or e_full is None:                            # charge-based battery
+        c_now, c_full = num("charge_now"), num("charge_full")      # uAh
+        volt = num("voltage_min_design") or num("voltage_now")     # uV
+        if None in (c_now, c_full, volt):
+            return None
+        e_now, e_full = c_now * volt // 1_000_000, c_full * volt // 1_000_000
+    on_ac = any(read_first(f"{d}/online") == "1" for d in ac)
+    return {"e_mwh": e_now / 1000, "full_mwh": e_full / 1000,
+            "pct": num("capacity"), "ac": on_ac}
+
+
 def snapshot(bus):
     s = {}
     s.update(probe_service())
@@ -196,6 +238,8 @@ class Agent:
         self.last = None
         self.last_logged = 0.0
         self.s0ix_before_sleep = None
+        self.sleep_start = None          # (wall time, battery state)
+        self.inhibit_fd = None
 
     def check(self, reason="poll"):
         s = snapshot(self.bus)
@@ -211,19 +255,78 @@ class Agent:
             self.last, self.last_logged = key, now
         return True
 
+    def take_inhibitor(self):
+        """Hold a logind 'delay' lock so the pre-sleep readings are taken before sleeping."""
+        if self.bus is None or self.inhibit_fd is not None:
+            return
+        try:
+            res, fds = self.bus.call_with_unix_fd_list_sync(
+                "org.freedesktop.login1", "/org/freedesktop/login1",
+                "org.freedesktop.login1.Manager", "Inhibit",
+                GLib.Variant("(ssss)", ("sleep", "cros-fprintd-monitor",
+                                        "record battery and S0ix before sleeping", "delay")),
+                GLib.VariantType("(h)"), Gio.DBusCallFlags.NONE, 5000, None, None)
+            self.inhibit_fd = fds.get(res.unpack()[0])
+        except GLib.Error as e:
+            log("ERROR", f"cannot take sleep delay lock: {e.message}")
+
+    def release_inhibitor(self):
+        if self.inhibit_fd is not None:
+            os.close(self.inhibit_fd)
+            self.inhibit_fd = None
+
     def on_prepare_for_sleep(self, conn, sender, path, iface, signal, params):
         going_down = params.unpack()[0]
         if going_down:
             self.s0ix_before_sleep = s0ix_usec()
-            log("EVENT", f"suspend (sleep mode {sleep_mode()})")
+            self.sleep_start = (time.time(), battery_state())
+            b = self.sleep_start[1]
+            batt = f", battery {b['pct']}%{' on AC' if b['ac'] else ''}" if b else ""
+            log("EVENT", f"suspend (sleep mode {sleep_mode()}{batt})")
+            self.release_inhibitor()                  # let the system go to sleep now
         else:
-            after = s0ix_usec()
-            gained = ""
-            if after is not None and self.s0ix_before_sleep is not None:
-                gained = f", S0ix gained {(after - self.s0ix_before_sleep) / 1e6:.1f} s"
-            log("EVENT", "resume" + gained)
+            self.take_inhibitor()
+            self.log_sleep()
             for delay in (3, 15, 60):
                 GLib.timeout_add_seconds(delay, self._once, f"resume+{delay}s")
+
+    def log_sleep(self):
+        after = s0ix_usec()
+        s0ix_s = None
+        if after is not None and self.s0ix_before_sleep is not None:
+            s0ix_s = (after - self.s0ix_before_sleep) / 1e6
+        if self.sleep_start is None:
+            log("EVENT", "resume (no pre-sleep readings)")
+            return
+        t0, b0 = self.sleep_start
+        self.sleep_start = None
+        dur = time.time() - t0
+        b1 = battery_state()
+        parts = [f"slept {dur / 3600:.2f} h"]
+        if s0ix_s is not None and dur > 0:
+            parts.append(f"S0ix {s0ix_s:.0f} s ({min(100.0, 100 * s0ix_s / dur):.0f}%)")
+        record = f"dur_s={dur:.0f} s0ix_s={s0ix_s if s0ix_s is not None else -1:.0f}"
+        if b0 and b1:
+            used = b0["e_mwh"] - b1["e_mwh"]
+            ac = b0["ac"] or b1["ac"]
+            record += (f" e0_mwh={b0['e_mwh']:.0f} e1_mwh={b1['e_mwh']:.0f}"
+                       f" full_mwh={b1['full_mwh']:.0f} pct0={b0['pct']} pct1={b1['pct']}"
+                       f" ac={int(ac)}")
+            if ac:
+                parts.append("on AC (not counted for battery statistics)")
+            elif dur >= 60:
+                watts = used / 1000 / (dur / 3600)
+                pct_h = (b0["pct"] - b1["pct"]) / (dur / 3600) if None not in (b0["pct"], b1["pct"]) else None
+                parts.append(f"battery {b0['pct']}% -> {b1['pct']}%, {used / 1000:.2f} Wh, "
+                             f"{watts * 1000:.0f} mW average")
+                if pct_h is not None:
+                    parts.append(f"{pct_h:.2f} %/h")
+                if watts > 0 and dur >= 600:
+                    parts.append(f"standby from full ~{b1['full_mwh'] / 1000 / watts / 24:.1f} days")
+                elif dur < 600:
+                    parts.append("too short for a standby estimate")
+        log("EVENT", "resume: " + ", ".join(parts))
+        log("SLEEP", record)
 
     def _once(self, reason):
         self.check(reason)
@@ -250,9 +353,47 @@ class Agent:
             self.bus.signal_subscribe("org.freedesktop.login1", "org.freedesktop.login1.Manager",
                                       "PrepareForSleep", "/org/freedesktop/login1", None,
                                       Gio.DBusSignalFlags.NONE, self.on_prepare_for_sleep)
+            self.take_inhibitor()
         threading.Thread(target=self.follow_journal, daemon=True).start()
         GLib.timeout_add_seconds(INTERVAL, self.check)
         GLib.MainLoop().run()
+
+
+def battery_report(min_minutes=10):
+    """Summarise the SLEEP records: average standby power and expected standby time."""
+    rows = []
+    for path in (LOG + ".1", LOG):
+        try:
+            with open(path) as f:
+                for line in f:
+                    if " SLEEP " not in line:
+                        continue
+                    kv = dict(x.split("=", 1) for x in line.split() if "=" in x)
+                    rows.append((line[:19], kv))
+        except OSError:
+            pass
+    usable = [(t, kv) for t, kv in rows
+              if "e0_mwh" in kv and kv.get("ac") == "0" and float(kv["dur_s"]) >= min_minutes * 60]
+    print(f"sleep periods logged: {len(rows)}, on battery and >= {min_minutes} min: {len(usable)}")
+    if not usable:
+        print("Not enough data yet: suspend on battery for a while (overnight is ideal), then try again.")
+        return
+    total_h = sum(float(kv["dur_s"]) for _, kv in usable) / 3600
+    total_wh = sum(float(kv["e0_mwh"]) - float(kv["e1_mwh"]) for _, kv in usable) / 1000
+    full_wh = float(usable[-1][1]["full_mwh"]) / 1000
+    s0ix = [float(kv["s0ix_s"]) / float(kv["dur_s"]) for _, kv in usable if float(kv.get("s0ix_s", -1)) >= 0]
+    for t, kv in usable[-10:]:
+        h = float(kv["dur_s"]) / 3600
+        wh = (float(kv["e0_mwh"]) - float(kv["e1_mwh"])) / 1000
+        print(f"  {t}  {h:5.2f} h  {kv['pct0']:>3}% -> {kv['pct1']:>3}%  {wh * 1000 / h:6.0f} mW")
+    watts = total_wh / total_h if total_h else 0
+    print(f"total: {total_h:.1f} h asleep on battery, {total_wh:.2f} Wh used")
+    print(f"average standby power: {watts * 1000:.0f} mW ({100 * watts / full_wh:.2f} % of a full battery per hour)")
+    if s0ix:
+        print(f"average share of sleep time in S0ix: {100 * sum(s0ix) / len(s0ix):.0f} %")
+    if watts > 0:
+        print(f"expected standby time from full: ~{full_wh / watts:.0f} h (~{full_wh / watts / 24:.1f} days)"
+              f" (battery now holds {full_wh:.1f} Wh when full)")
 
 
 def main():
@@ -275,6 +416,8 @@ def main():
         log("MARK", text)
         log("STATE", "[mark] " + fmt(s))
         print("marked:", fmt(s))
+    elif cmd == "battery":
+        battery_report()
     else:
         print(__doc__)
         return 2
