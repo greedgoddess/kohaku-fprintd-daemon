@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+/* [doc:prb-enroll] */
 /*
  * fpprobe5.c - run a full enrollment, driven by MKBP fingerprint events
  *

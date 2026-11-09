@@ -15,6 +15,7 @@
 # has set one since the last boot, reboot before installing.
 set -euo pipefail
 
+# [doc:ins-config]
 MIN_FW="2609.3"
 R="${FPRINTD_CHECK_ROOT:-}"   # path prefix for testing the checks; empty in real use
 D="${FPRINTD_DESTDIR:-}"      # path prefix for testing install/uninstall; empty in real use
@@ -34,6 +35,7 @@ FAILED=0
 ok()  { printf '  [ok]   %s\n' "$*"; }
 bad() { printf '  [FAIL] %s\n' "$*"; FAILED=1; }
 
+# [doc:ins-checks]
 check_static() {
     echo "Checking requirements:"
 
@@ -83,6 +85,7 @@ s0ix_residency() {
     cat "$R/sys/kernel/debug/pmc_core/slp_s0_residency_usec" 2>/dev/null || true
 }
 
+# [doc:ins-s0ix-test]
 check_s0ix_works() {
     local before after ans
     before=$(s0ix_residency)
@@ -113,6 +116,7 @@ check_s0ix_works() {
 
 # Connected USB readers that the stock fprintd (libfprint) supports. Masking fprintd
 # makes them stop working, so the installer asks first. Prints "vendor:product driver".
+# [doc:ins-readers]
 libfprint_readers() {
     local hwdb="$R/usr/lib/udev/hwdb.d/60-autosuspend-libfprint-2.hwdb" d
     [ -r "$hwdb" ] || return 0
@@ -150,6 +154,7 @@ FPRINTD_STATE_FILE=$STATE/installer-fprintd-state
 
 # States of fprintd.service that can be restored exactly. Others (linked, alias,
 # generated, transient, ...) are refused before anything is changed.
+# [doc:ins-fprintd-state]
 fprintd_state_supported() {
     case "$1" in
         static|indirect|disabled|enabled|enabled-runtime|masked|masked-runtime) return 0 ;;
@@ -173,6 +178,7 @@ restore_fprintd() {      # restore_fprintd <is-enabled state> <is-active state> 
 }
 
 case "${1:-}" in
+    # [doc:ins-uninstall]
     --uninstall)
         systemctl disable --now cros-fprintd.service 2>/dev/null || true
         if [ -r "$FPRINTD_STATE_FILE" ]; then
@@ -212,6 +218,7 @@ check_all
 
 dnf install -y fprintd fprintd-pam python3-gobject
 
+# [doc:ins-reader-question]
 READERS="$(libfprint_readers)"
 if [ -n "$READERS" ]; then
     echo
@@ -227,6 +234,7 @@ if [ -n "$READERS" ]; then
 fi
 
 # --- install, with rollback to the previous state if any step fails -----------
+# [doc:ins-prev-state]
 PREV_ENABLED="$(systemctl is-enabled fprintd.service 2>/dev/null || true)"
 PREV_ACTIVE="$(systemctl is-active fprintd.service 2>/dev/null || true)"
 UPGRADE=no
@@ -247,6 +255,7 @@ for f in "$BIN" "$UNIT" "$UDEV_RULE" "$DROPIN_DIR/stop-on-suspend.conf"; do
     if [ -e "$f" ]; then cp -a "$f" "$BACKUP/$(basename "$f")"; fi
 done
 
+# [doc:ins-rollback]
 rollback() {
     trap - ERR
     echo >&2
@@ -275,6 +284,7 @@ rollback() {
 set -E
 trap rollback ERR
 
+# [doc:ins-install]
 install -D "${OWNER[@]}" -m 0755 "$HERE/cros-fprintd" "$BIN"
 install -D "${OWNER[@]}" -m 0644 "$HERE/systemd/cros-fprintd.service" "$UNIT"
 install -D "${OWNER[@]}" -m 0644 "$HERE/udev/70-cros-fprintd.rules" "$UDEV_RULE"
@@ -295,6 +305,7 @@ if ! systemctl is-active --quiet cros-fprintd.service; then
     systemctl --no-pager --full status cros-fprintd.service >&2 || true
     rollback
 fi
+# [doc:ins-record]
 # Record the original fprintd state while rollback is still armed: if this fails,
 # the installation is undone instead of losing the information.
 if [ "$STATE_FILE_EXISTED" = no ]; then

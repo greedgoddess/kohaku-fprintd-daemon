@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
+# [doc:tst-fake-chip]
 """Run cros-fprintd on the session bus with a simulated MCU (tests only).
 
     tests/fake_daemon.py --state-dir /tmp/x [-v]

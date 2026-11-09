@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# [doc:tst-lockout]
 """Lockout test: after 5 failed matches VerifyStart is refused.
 
 Run via tests/run-fake-tests.sh (needs the fake daemon with FAKE_NEVER_MATCH=1).

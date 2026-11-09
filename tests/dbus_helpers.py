@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# [doc:tst-helpers]
 """Small shared helpers for the D-Bus tests (session bus, signals, checks)."""
 import os
 import time

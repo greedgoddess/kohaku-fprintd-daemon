@@ -134,6 +134,7 @@ The script verifies the tag's signature and scans for secrets. It then builds a 
 
 ## Documentation
 
+- [docs/CODE.md](docs/CODE.md): code map. Important blocks carry a `[doc:<id>]` tag that's explained there.
 - [docs/SUSPEND.md](docs/SUSPEND.md): why suspend needs S0ix, and why deep sleep isn't supported.
 - [docs/CRFPMOC.md](docs/CRFPMOC.md): test report for libfprint's crfpmoc driver on Kohaku.
 

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# [doc:tst-delete-race]
 """Deleting fingers while a verify runs: no match for the deleted print, nothing recreated.
 
 Run via tests/run-fake-tests.sh (fake daemon with FAKE_MATCH_INDEX=0, so every attempt

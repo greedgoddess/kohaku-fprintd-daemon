@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# [doc:tst-match-ordering]
 """A deletion handled between the worker's match and the signal must win.
 
 Drives the daemon's Service directly: a match result is queued, then fingers are

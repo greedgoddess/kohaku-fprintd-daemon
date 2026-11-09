@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# [doc:tst-store]
 """Unit tests for the daemon's storage: private files, size limits, deletion races."""
 import importlib.machinery
 import importlib.util

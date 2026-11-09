@@ -51,10 +51,12 @@ from gi.repository import Gio, GLib  # noqa: E402
 log = logging.getLogger("cros-fprintd")
 
 # ---------------------------------------------------------------- constants --
+# [doc:dmn-ioctl]
 CROS_EC_DEV_IOCXCMD = 0xC014EC00          # _IOWR(0xEC, 0, struct cros_ec_command)
 CROS_EC_DEV_IOCEVENTMASK = 0xEC02         # _IO(0xEC, 2), argument = event mask
 EC_MKBP_EVENT_FINGERPRINT = 5
 
+# [doc:dmn-commands]
 CMD_FP_MODE = 0x0402
 CMD_FP_INFO = 0x0403
 CMD_FP_FRAME = 0x0404
@@ -63,6 +65,7 @@ CMD_FP_CONTEXT = 0x0406
 CMD_FP_SEED = 0x0408
 CMD_FP_ENC_STATUS = 0x0409
 
+# [doc:dmn-modes]
 MODE_IDLE = 0
 MODE_ENROLL = (1 << 4) | (1 << 5)         # ENROLL_SESSION | ENROLL_IMAGE
 MODE_MATCH = 1 << 6
@@ -70,15 +73,18 @@ MODE_MATCH = 1 << 6
 EV_ENROLL = 1 << 27
 EV_MATCH = 1 << 28
 
+# [doc:dmn-limits]
 SEED_STRUCT_VERSION = 4
 TEMPLATE_COMMIT = 0x80000000
 CHUNK = 512
 MAX_TEMPLATE_BYTES = 1 << 20               # sanity limit for MCU-reported and on-disk templates
 MAX_TEMPLATES = 15                         # the frame index has 4 bits (index 1..15)
+# [doc:dmn-lockout-policy]
 MAX_FAILED_MATCHES = 5                     # consecutive failures before a lockout
 LOCKOUT_SECONDS = 600                      # fingerprint refused for 10 minutes after that
 ENROLL_STAGES = 12                         # estimate; GNOME uses it for its progress ring
 
+# [doc:dmn-dbus-names]
 BUS_TYPE = Gio.BusType.SYSTEM            # the test harness switches this to SESSION
 BUS_NAME = "net.reactivated.Fprint"
 MGR_PATH = "/net/reactivated/Fprint/Manager"
@@ -93,6 +99,7 @@ FINGERS = {
     for name in ("thumb", "index-finger", "middle-finger", "ring-finger", "little-finger")
 }
 
+# [doc:dmn-introspection]
 INTROSPECTION = f"""
 <node>
   <interface name="{MGR_IFACE}">
@@ -139,12 +146,14 @@ class McuError(Exception):
 class Mcu:
     """The fingerprint MCU behind /dev/cros_fp."""
 
+    # [doc:dmn-mcu-open]
     def __init__(self, path):
         self.fd = os.open(path, os.O_RDWR)
         self.lock = threading.Lock()
         fcntl.ioctl(self.fd, CROS_EC_DEV_IOCEVENTMASK, 1 << EC_MKBP_EVENT_FINGERPRINT)
         self._template_size = None
 
+    # [doc:dmn-mcu-xfer]
     def xfer(self, cmd, ver=0, data=b"", insize=0):
         n = max(len(data), insize)
         buf = bytearray(struct.pack("<5I", ver, cmd, len(data), insize, 0) + data.ljust(n, b"\0"))
@@ -166,6 +175,7 @@ class Mcu:
         out = self._ok(CMD_FP_ENC_STATUS, 0, b"", 8)
         return struct.unpack("<II", out)[1]
 
+    # [doc:dmn-seed]
     def ensure_seed(self, seed, seed_is_new):
         if self.enc_status() & 1:
             if seed_is_new:
@@ -177,6 +187,7 @@ class Mcu:
         self._ok(CMD_FP_SEED, 0, struct.pack("<HH", SEED_STRUCT_VERSION, 0) + seed)
         log.info("seed set")
 
+    # [doc:dmn-context]
     def set_context(self, userid):
         """Set the user context. This clears all templates held by the MCU."""
         self._ok(CMD_FP_CONTEXT, 1, struct.pack("<B3x", 0) + userid)
@@ -188,6 +199,7 @@ class Mcu:
             time.sleep(0.1)
         raise McuError("timed out waiting for the user context to be set")
 
+    # [doc:dmn-info]
     def info(self):
         b = self._ok(CMD_FP_INFO, 1, b"", 48)
         if len(b) < 48:
@@ -206,6 +218,7 @@ class Mcu:
             self.info()
         return self._template_size
 
+    # [doc:dmn-transfer]
     def _chunks(self):
         size = self.template_size
         for off in range(0, size, CHUNK):
@@ -229,6 +242,7 @@ class Mcu:
             out += part
         return bytes(out)
 
+    # [doc:dmn-mode-events]
     def set_mode(self, mode):
         self._ok(CMD_FP_MODE, 0, struct.pack("<I", mode), 4)
 
@@ -247,6 +261,7 @@ class Mcu:
 
 
 # ------------------------------------------------------------------ storage --
+# [doc:dmn-atomic-write]
 def atomic_write(path, data):
     """Write through an unpredictable temporary file in the same directory, then rename."""
     d = os.path.dirname(path)
@@ -268,6 +283,7 @@ def atomic_write(path, data):
         os.close(dfd)
 
 
+# [doc:dmn-private-files]
 def check_private(st, path):
     """Refuse files that aren't ours alone (regular file, owner = us, no group/other bits)."""
     if not stat.S_ISREG(st.st_mode):
@@ -304,6 +320,7 @@ def ensure_private_dir(path):
         os.chmod(path, 0o700)
 
 
+# [doc:dmn-store]
 class Store:
     """Seed and per-user templates under the state directory (all private to root)."""
 
@@ -325,6 +342,7 @@ class Store:
         if len(self.seed) != 32:
             raise ValueError(f"{seed_path} must be exactly 32 bytes")
 
+    # [doc:dmn-userid]
     def userid(self, user):
         return hmac.new(self.seed, b"cros-fprintd user:" + user.encode(), hashlib.sha256).digest()
 
@@ -337,6 +355,7 @@ class Store:
         with self.lock:
             return self._generation.get(user, 0)
 
+    # [doc:dmn-fingers-json]
     def fingers(self, user):
         """Enrolled finger names in MCU load order."""
         d = self._dir(user)
@@ -367,6 +386,7 @@ class Store:
     def read_finger(self, user, finger):
         return read_private(os.path.join(self._dir(user), finger + ".bin"), MAX_TEMPLATE_BYTES)
 
+    # [doc:dmn-generation]
     def save(self, user, generation, templates=None, order=None):
         """Write templates ({finger: blob}) and/or the finger order, unless prints were
         deleted since `generation` was taken. Returns False if skipped."""
@@ -392,6 +412,7 @@ class Store:
 
 
 # ------------------------------------------------------------------ service --
+# [doc:dmn-lockout]
 class Lockout:
     """Refuse fingerprint verification for a while after repeated failed matches.
 
@@ -422,6 +443,7 @@ class Lockout:
             self._failures.pop(user, None)
 
 
+# [doc:dmn-session]
 class Session:
     def __init__(self, kind, user):
         self.kind = kind                      # "verify" or "enroll"
@@ -451,6 +473,7 @@ class Service:
             return False
         GLib.idle_add(do)
 
+    # [doc:dmn-match-result]
     def _emit_match_result(self, user, generation, name, ok):
         """Report a match result from the main loop, where D-Bus deletions also run.
         A deletion is then either entirely before this check (reported as no match)
@@ -484,6 +507,7 @@ class Service:
             Gio.DBusCallFlags.NONE, -1, None)
         return reply.unpack()[0]
 
+    # [doc:dmn-access]
     def _resolve_user(self, sender, username):
         """Return the user the call is for, enforcing: same user or root."""
         uid = self._caller_uid(sender)
@@ -520,6 +544,7 @@ class Service:
         self._require_claim(sender)
         self.store.delete_all(self.user)
 
+    # [doc:dmn-claim]
     def m_Claim(self, sender, args):
         user = self._resolve_user(sender, args[0])
         if self.claimed_by is not None:
@@ -533,6 +558,7 @@ class Service:
         self._require_claim(sender)
         self.release()
 
+    # [doc:dmn-release]
     def release(self):
         """Drop the claim. A running worker is told to stop, and the device stays busy
         until it has really ended, so two workers never use the MCU at the same time."""
@@ -544,6 +570,7 @@ class Service:
                 self.session = None
         self.claimed_by = self.user = None
 
+    # [doc:dmn-worker]
     def _start(self, kind, target, finger):
         if self.session is not None:
             raise FprintError("AlreadyInUse", "Device is busy")
@@ -600,6 +627,7 @@ class Service:
         return self._start("enroll", self._enroll_worker, finger)
 
     # -- MCU workflows (run in worker threads) -----------------------------
+    # [doc:dmn-prepare]
     def _prepare_user(self, user, fingers, stop):
         """Seed + context + load the given fingers' templates. Returns the loaded names."""
         self.mcu.ensure_seed(self.store.seed, self.store.seed_is_new)
@@ -616,6 +644,7 @@ class Service:
                 log.error("could not load %s for %s: %s", f, user, e)
         return loaded
 
+    # [doc:dmn-save-dirty]
     def _save_if_dirty(self, user, loaded, generation):
         try:
             if loaded and self.mcu.info()["dirty"]:
@@ -632,6 +661,7 @@ class Service:
         except McuError as e:
             log.error("could not set idle mode: %s", e)
 
+    # [doc:dmn-verify]
     def _verify_worker(self, user, finger, stop):
         loaded, generation = [], self.store.generation(user)
         try:
@@ -649,6 +679,7 @@ class Service:
                     continue
                 err, idx = ev & 0xF, (ev >> 12) & 0xF
                 if err in (1, 3, 5):
+                    # [doc:dmn-index-check]
                     if idx >= len(loaded):        # never trust an index we didn't load
                         log.warning("MCU reported a match for invalid template index %d", idx)
                         self.lockout.failed(user)
@@ -679,6 +710,7 @@ class Service:
             self._finish_mcu()
             self._save_if_dirty(user, loaded, generation)
 
+    # [doc:dmn-enroll]
     def _enroll_worker(self, user, finger, stop):
         generation = self.store.generation(user)
         try:
@@ -733,6 +765,7 @@ class Service:
             self._finish_mcu()
 
     # -- D-Bus plumbing ---------------------------------------------------
+    # [doc:dmn-client-gone]
     def on_name_owner_changed(self, conn, sender, path, iface, signal, params):
         name, _old, new = params.unpack()
         if new == "" and name == self.claimed_by:
@@ -756,6 +789,7 @@ class Service:
         }
         return values.get(prop)
 
+    # [doc:dmn-dispatch]
     def device_call(self, conn, sender, path, iface, method, params, invocation):
         handler = getattr(self, "m_" + method, None)
         if log.isEnabledFor(logging.DEBUG):
@@ -795,6 +829,7 @@ class Service:
 
 
 # --------------------------------------------------------------------- main --
+# [doc:dmn-main]
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--device", default="/dev/cros_fp")

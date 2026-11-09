@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# [doc:tst-lockout-reset]
 """Lockout details: a successful match resets the count, and the lockout expires.
 
 Run via tests/run-fake-tests.sh with FAKE_MATCH_PATTERN=nnnnynnnnnn (4 failures, a match,

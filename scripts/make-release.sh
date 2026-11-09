@@ -20,6 +20,7 @@ ver="${tag#v}"
 name="kohaku-fprintd-$ver"
 files=(cros-fprintd install.sh systemd/cros-fprintd.service udev/70-cros-fprintd.rules README.md LICENSE)
 
+# [doc:rel-signature]
 # --- provenance: verify the tag signature if there is one
 if git cat-file tag "$tag" 2>/dev/null | grep -qE 'BEGIN (PGP|SSH) SIGNATURE'; then
     git tag -v "$tag" >/dev/null 2>&1 || { echo "tag $tag has a signature that does not verify" >&2; exit 1; }
@@ -28,6 +29,7 @@ else
     echo "WARNING: tag $tag is not signed (see README, Releasing)" >&2
 fi
 
+# [doc:rel-secrets]
 # --- secret scan over everything tracked at the tag
 bad_files="$(git ls-tree -r --name-only "$tag" | grep -E '(^|/)(seed(\.bin)?|template[0-9]*\.bin)$|\.(bin|pem|key)$' || true)"
 if [ -n "$bad_files" ]; then
@@ -43,6 +45,7 @@ if git grep -I -n -E "$secret_re" "$tag" -- . >/dev/null 2>&1; then
 fi
 echo "secret scan: clean"
 
+# [doc:rel-archive]
 # --- reproducible archive
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT

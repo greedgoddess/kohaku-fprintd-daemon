@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+/* [doc:prb-hello] */
 /*
  * fpprobe.c - read-only: is the fingerprint MCU answering, and what is it?
  *

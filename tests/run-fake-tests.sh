@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
+# [doc:tst-runner]
 # Run all tests: storage unit tests, D-Bus tests against a simulated MCU on a private
 # session bus, and installer tests in a temporary directory. No hardware and no root needed.  Usage:  tests/run-fake-tests.sh
 set -u
@@ -61,6 +62,9 @@ run_suite "lockout reset and expiry" "$TMP/s7" test_lockout_reset.py \
 run_suite "invalid index"  "$TMP/s3" test_bad_index.py FAKE_MATCH_INDEX=9
 run_suite "worker lifetime" "$TMP/s5" test_concurrency.py FAKE_LOAD_DELAY=3
 run_suite "delete during verify" "$TMP/s6" test_delete_race.py FAKE_MATCH_INDEX=0 FAKE_LOAD_DELAY=2
+
+echo "---- code documentation tags"
+bash "$HERE/test_doc_tags.sh" || RC=1
 
 echo "---- installer"
 bash "$HERE/test_installer.sh" || RC=1

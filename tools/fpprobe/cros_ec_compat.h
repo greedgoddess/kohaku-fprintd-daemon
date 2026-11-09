@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+/* [doc:prb-compat] */
 /*
  * Minimal re-declaration of the cros_ec character-device interface (the
  * struct cros_ec_command layout and the CROS_EC_DEV_IOCXCMD ioctl number), as

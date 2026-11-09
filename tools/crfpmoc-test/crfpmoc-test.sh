@@ -20,6 +20,7 @@ PROBE="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../fpprobe/fpprobe7"
 BOOT_ID="$(cat /proc/sys/kernel/random/boot_id)"
 # cros-fprintd's unit is a file in /etc, so it can't be masked; a drop-in with an
 # impossible condition keeps it from starting instead (also when udev asks for it).
+# [doc:crf-hold]
 HOLD=/etc/systemd/system/cros-fprintd.service.d/zz-crfpmoc-test.conf
 
 chip_seed() {      # prints 1 if the chip already has a seed this boot, 0 if not, ? if unknown
@@ -31,6 +32,7 @@ chip_seed() {      # prints 1 if the chip already has a seed this boot, 0 if not
 }
 
 case "${1:-}" in
+# [doc:crf-build]
 build)
     sudo dnf install -y git meson ninja-build gcc
     sudo dnf builddep -y libfprint
@@ -50,6 +52,7 @@ build)
     echo "Built. Next: $0 hold, reboot, then: $0 run"
     ;;
 
+# [doc:crf-patch]
 patch)
     # FP_MODE always returns 4 bytes on this firmware; calls that expect 0 fail with EMSGSIZE.
     [ -d "$SRC" ] || { echo "run '$0 build' first" >&2; exit 1; }
@@ -79,6 +82,7 @@ hold)
     echo "cros-fprintd is held back. Reboot now, then: $0 run"
     ;;
 
+# [doc:crf-run]
 run)
     [ -e "$LIB/libfprint-2.so.2" ] || { echo "run '$0 build' first" >&2; exit 1; }
     if [ ! -e "$HOLD" ]; then

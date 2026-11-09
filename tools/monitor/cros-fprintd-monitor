@@ -54,6 +54,7 @@ _lock = threading.Lock()
 
 
 # ------------------------------------------------------------------ output --
+# [doc:mon-log]
 def log(kind, text):
     line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {kind:<7} {text}\n"
     with _lock:
@@ -74,6 +75,7 @@ def ec(fd, cmd, data=b"", insize=0, ver=0):
     return struct.unpack_from("<I", buf, 16)[0], bytes(buf[20:20 + max(ret, 0)])
 
 
+# [doc:mon-probe-chip]
 def probe_mcu():
     """Read-only checks of the MCU. Returns a dict of short strings."""
     out = {"dev": "yes" if os.path.exists(DEV) else "MISSING"}
@@ -175,6 +177,7 @@ def power_supplies():
     return bat, ac
 
 
+# [doc:mon-battery]
 def battery_state():
     """Energy now/full in mWh, capacity in %, and whether external power is connected."""
     bat, ac = power_supplies()
@@ -197,6 +200,7 @@ def battery_state():
             "pct": num("capacity"), "ac": on_ac}
 
 
+# [doc:mon-snapshot]
 def snapshot(bus):
     s = {}
     s.update(probe_service())
@@ -255,6 +259,7 @@ class Agent:
             self.last, self.last_logged = key, now
         return True
 
+    # [doc:mon-inhibit]
     def take_inhibitor(self):
         """Hold a logind 'delay' lock so the pre-sleep readings are taken before sleeping."""
         if self.bus is None or self.inhibit_fd is not None:
@@ -290,6 +295,7 @@ class Agent:
             for delay in (3, 15, 60):
                 GLib.timeout_add_seconds(delay, self._once, f"resume+{delay}s")
 
+    # [doc:mon-sleep]
     def log_sleep(self):
         after = s0ix_usec()
         s0ix_s = None
@@ -332,6 +338,7 @@ class Agent:
         self.check(reason)
         return False
 
+    # [doc:mon-journal]
     def follow_journal(self):
         try:
             p = subprocess.Popen(["journalctl", "-f", "-n", "0", "-o", "short-iso"],
@@ -359,6 +366,7 @@ class Agent:
         GLib.MainLoop().run()
 
 
+# [doc:mon-report]
 def battery_report(min_minutes=10):
     """Summarise the SLEEP records: average standby power and expected standby time."""
     rows = []

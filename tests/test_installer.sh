@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
+# [doc:tst-installer]
 # Installer/uninstaller safety tests. Runs entirely inside a temporary directory:
 # FPRINTD_CHECK_ROOT points the requirement checks at a fake /sys, FPRINTD_DESTDIR
 # prefixes every installed path, and systemctl/udevadm/dnf are stubs. No root needed.

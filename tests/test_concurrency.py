@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# [doc:tst-worker]
 """A released session must keep the device busy until its worker has really ended.
 
 Run via tests/run-fake-tests.sh (fake daemon with FAKE_LOAD_DELAY=3, so a verify

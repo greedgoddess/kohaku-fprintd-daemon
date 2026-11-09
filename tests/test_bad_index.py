@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# [doc:tst-bad-index]
 """A match report with a template index the daemon never loaded must not count as a match.
 
 Run via tests/run-fake-tests.sh (fake daemon with FAKE_MATCH_INDEX=9).
