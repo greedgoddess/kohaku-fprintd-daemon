@@ -2,7 +2,7 @@
 
 [![Latest release](https://img.shields.io/github/v/release/greedgoddess/kohaku-fprintd-daemon?label=release)](https://github.com/greedgoddess/kohaku-fprintd-daemon/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-![Status: experimental](https://img.shields.io/badge/status-experimental-orange)
+![Status: alpha](https://img.shields.io/badge/status-alpha-yellow)
 
 **Fingerprint unlock for the Samsung Galaxy Chromebook (Kohaku) on Fedora.**
 `sudo`, the GNOME lock screen and the `fprintd-*` tools use the built-in reader.
@@ -10,12 +10,12 @@
 The daemon, `cros-fprintd`, provides the standard `fprintd` D-Bus interface and talks to the ChromeOS fingerprint chip through `/dev/cros_fp`.
 
 > [!WARNING]
-> - **Experimental and pre-1.0.** It was built for and tested on one laptop: Kohaku, MrChromebox 2609.3, Fedora 45, GNOME Shell 51. It isn't regularly maintained; forks are welcome.
+> - **Alpha.** It was built for and tested on one laptop: Kohaku, MrChromebox 2609.3, Fedora 45, GNOME Shell 51, including a week of daily use ([field test](docs/FIELD-TEST.md)). It isn't regularly maintained; forks are welcome.
 > - **It runs as root and changes your PAM configuration.** Keep a root shell open while you enable fingerprint. Your password always remains a fallback.
 > - **Not security-audited.** Treat fingerprint as a convenience, not as your only protection.
 
 > [!NOTE]
-> This project was written largely by an AI assistant (Claude, by Anthropic), directed and tested on the hardware by the author. It has had no independent review, so read `install.sh` and `cros-fprintd` before running them as root.
+> Developed with AI: the human owner decides and tests on the hardware, Claude (Anthropic) writes the code, and ChatGPT (OpenAI) reviews it externally. There has been no independent human code review yet, so read `install.sh` and `cros-fprintd` before running them as root. Details: [docs/AI-DISCLOSURE.md](docs/AI-DISCLOSURE.md).
 
 ## Requirements
 
@@ -39,6 +39,8 @@ The installer checks these and refuses to install otherwise.
 | GNOME lock screen | ✅ |
 | After suspend | ✅ |
 | polkit prompts, GNOME Settings | untested |
+
+One week of daily use: no unexpected behaviour, 100 % S0ix while asleep, about 0.5 % battery per hour in standby. See [docs/FIELD-TEST.md](docs/FIELD-TEST.md).
 
 ## Similar projects
 
@@ -127,13 +129,15 @@ sudo systemctl daemon-reload && sudo systemctl restart cros-fprintd
 ```bash
 git tag -s vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z && scripts/make-release.sh vX.Y.Z \
   && gh release create vX.Y.Z dist/kohaku-fprintd.tar.gz dist/kohaku-fprintd.tar.gz.sha256 \
-       --title "vX.Y.Z (experimental)" --notes-file release-notes.md
+       --title "vX.Y.Z (alpha)" --notes-file release-notes.md
 ```
 
 The script verifies the tag's signature and scans for secrets. It then builds a reproducible tarball with only the user files.
 
 ## Documentation
 
+- [docs/FIELD-TEST.md](docs/FIELD-TEST.md): results of a week of daily use.
+- [docs/AI-DISCLOSURE.md](docs/AI-DISCLOSURE.md): who did what, and the external reviews.
 - [docs/CODE.md](docs/CODE.md): code map. Important blocks carry a `[doc:<id>]` tag that's explained there.
 - [docs/SUSPEND.md](docs/SUSPEND.md): why suspend needs S0ix, and why deep sleep isn't supported.
 - [docs/CRFPMOC.md](docs/CRFPMOC.md): test report for libfprint's crfpmoc driver on Kohaku.

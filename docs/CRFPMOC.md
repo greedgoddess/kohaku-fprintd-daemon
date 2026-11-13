@@ -27,25 +27,9 @@ The later checks (verify, saving updated templates, reboot, suspend, `sudo`, loc
 
 **1. Building only crfpmoc fails.** With `-Ddrivers=crfpmoc`, the build stops at `#error "crfpmoc requires udev"`. libfprint enables udev support only when a driver on its udev list is part of the build. Building it together with `elanspi` works.
 
-**2. Mode commands expect no reply, but this firmware sends one.** Enrolment fails immediately:
+**2. Mode commands expect no reply, but this firmware sends one.** Enrolment fails immediately: the driver's clear-storage step reports an ioctl error ("message too long"), and the kernel reports that the chip sent 4 bytes where none were expected. On this firmware, the FP_MODE command always returns the current mode (4 bytes). cros-fprintd always accepts that reply. Four of crfpmoc's ten FP_MODE calls ask for a 0-byte reply. Asking for the 4-byte reply there, as the other six calls do, fixes this step (`crfpmoc-test.sh patch` applies that locally).
 
-```
-[crfpmoc] SSM CLEAR_STORAGE_STATES failed in state 0 with error: ioctl failed: Message too long
-cros-ec-spi spi-PRP0001:02: packet too long (4 bytes, expected 0)
-```
-
-On this firmware, the FP_MODE command always returns the current mode (4 bytes). cros-fprintd always accepts that reply. Four of crfpmoc's ten FP_MODE calls ask for a 0-byte reply. Asking for the 4-byte reply there, as the other six calls do, fixes this step (`crfpmoc-test.sh patch` applies that locally).
-
-**3. Then a read callback runs on a freed state machine, and fprintd crashes:**
-
-```
-crfpmoc_ssm_data_free: remove poll source 0
-crfpmoc_read_bytes: called
-libfprint-device-CRITICAL: fpi_device_get_cancellable: assertion 'FP_IS_DEVICE (device)' failed
-Segmentation fault
-```
-
-The read callback gets its state machine from the event source, without holding a reference. When the state machine was freed, the source wasn't removed, because its recorded ID was already 0. The next chip event then ran the callback on freed memory.
+**3. Then a read callback runs on a freed state machine, and fprintd crashes.** The read callback gets its state machine from the event source, without holding a reference. When the state machine was freed, the source wasn't removed, because its recorded ID was already 0. The next chip event then ran the callback on freed memory. GLib reported invalid device, stream and object pointers, and fprintd ended with a segmentation fault.
 
 ## Repeating the test
 
