@@ -23,10 +23,11 @@ The installer checks these and refuses to install otherwise.
 
 | Requirement | Notes |
 |---|---|
-| Kohaku with a working reader | `/dev/cros_fp` must exist |
+| Samsung Galaxy Chromebook (Kohaku) with a working reader | `/dev/cros_fp` must exist; other boards only with `--allow-untested-board` (see below) |
 | MrChromebox firmware **2609.3 or newer** | with the **S0ix** option enabled in the firmware setup (ESC at boot); firmware updates reset it |
 | s2idle with working S0ix | checked with a 20-second test suspend if needed |
 
+- **Other Chromebooks:** this may work on other Chromebooks with a ChromeOS fingerprint chip, but it's untested there. The installer refuses other models by default. `sudo ./install.sh --allow-untested-board` overrides that, at your own risk; the firmware and S0ix requirements still apply.
 - **Deep sleep (S3) isn't supported:** after it, the reader stays off until a full power-off. See [docs/SUSPEND.md](docs/SUSPEND.md).
 - **Other fingerprint readers (such as USB readers) don't work while this is installed,** because the stock `fprintd` gets masked. If one is connected, the installer asks first.
 

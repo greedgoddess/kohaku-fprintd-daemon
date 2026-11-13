@@ -49,6 +49,8 @@ This page explains each one; link to an entry as `docs/CODE.md#<id>`, and search
 | ID | What and why |
 |---|---|
 | <a id="ins-config"></a>`ins-config` | Minimum firmware and the test-only path prefixes (`FPRINTD_CHECK_ROOT`, `FPRINTD_DESTDIR`). |
+| <a id="ins-options"></a>`ins-options` | Reads `--allow-untested-board`; the remaining arguments select install, `--check` or `--uninstall`. |
+| <a id="ins-board"></a>`ins-board` | Board check: Google Kohaku passes; other boards fail unless `--allow-untested-board` turns it into a warning. |
 | <a id="ins-checks"></a>`ins-checks` | Requirement checks: chip, firmware version, FADT S0ix flag, LPS0 device, default sleep mode. |
 | <a id="ins-s0ix-test"></a>`ins-s0ix-test` | Proves S0ix works: residency since boot, or a 20-second test suspend. |
 | <a id="ins-readers"></a>`ins-readers` | Finds connected readers the stock fprintd supports, using libfprint's hardware database. |

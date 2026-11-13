@@ -5,9 +5,12 @@
 #   sudo ./install.sh                          check requirements, then install
 #   sudo ./install.sh --check                  only check the requirements
 #   sudo ./install.sh --uninstall [--purge]    remove (--purge: also seed + templates)
+#   --allow-untested-board                     with install or --check: accept a board
+#                                              other than Kohaku, at your own risk
 #
 # Supported configuration - anything else is refused:
-#   * a ChromeOS fingerprint MCU (/dev/cros_fp); tested on Kohaku only
+#   * the Samsung Galaxy Chromebook (Kohaku) with a ChromeOS fingerprint MCU (/dev/cros_fp);
+#     other boards only with --allow-untested-board
 #   * MrChromebox UEFI firmware 2609.3 or newer
 #   * suspend-to-idle with working S0ix; deep sleep (S3) is NOT supported
 #
@@ -21,6 +24,14 @@ R="${FPRINTD_CHECK_ROOT:-}"   # path prefix for testing the checks; empty in rea
 D="${FPRINTD_DESTDIR:-}"      # path prefix for testing install/uninstall; empty in real use
 
 [ "$(id -u)" -eq 0 ] || [ -n "$R" ] || [ -n "$D" ] || exec sudo "$0" "$@"
+
+# [doc:ins-options]
+ALLOW_UNTESTED_BOARD=no
+args=()
+for a in "$@"; do
+    if [ "$a" = --allow-untested-board ]; then ALLOW_UNTESTED_BOARD=yes; else args+=("$a"); fi
+done
+set -- "${args[@]+"${args[@]}"}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN=$D/usr/local/libexec/cros-fprintd
@@ -38,6 +49,19 @@ bad() { printf '  [FAIL] %s\n' "$*"; FAILED=1; }
 # [doc:ins-checks]
 check_static() {
     echo "Checking requirements:"
+
+    # [doc:ins-board]
+    local vendor product board
+    vendor="$(cat "$R/sys/class/dmi/id/sys_vendor" 2>/dev/null || true)"
+    product="$(cat "$R/sys/class/dmi/id/product_name" 2>/dev/null || true)"
+    board="$(cat "$R/sys/class/dmi/id/board_name" 2>/dev/null || true)"
+    if [ "${vendor,,}" = google ] && { [ "${product,,}" = kohaku ] || [ "${board,,}" = kohaku ]; }; then
+        ok "board: Kohaku (Samsung Galaxy Chromebook)"
+    elif [ "$ALLOW_UNTESTED_BOARD" = yes ]; then
+        printf '  [warn] %s\n' "untested board '${vendor:-?} ${product:-?}': allowed by --allow-untested-board, at your own risk"
+    else
+        bad "untested board '${vendor:-?} ${product:-?}': only the Samsung Galaxy Chromebook (Kohaku) is tested; override with --allow-untested-board, at your own risk"
+    fi
 
     if [ -e "$R/dev/cros_fp" ]; then
         ok "fingerprint MCU present (/dev/cros_fp)"
@@ -208,7 +232,7 @@ case "${1:-}" in
         if check_all; then exit 0; else exit 1; fi ;;
 esac
 
-[ -z "${1:-}" ] || { echo "unknown option: $1 (use --check or --uninstall)" >&2; exit 2; }
+[ -z "${1:-}" ] || { echo "unknown option: $1 (use --check, --uninstall or --allow-untested-board)" >&2; exit 2; }
 for f in cros-fprintd systemd/cros-fprintd.service udev/70-cros-fprintd.rules; do
     [ -f "$HERE/$f" ] || { echo "missing $HERE/$f" >&2; exit 1; }
 done

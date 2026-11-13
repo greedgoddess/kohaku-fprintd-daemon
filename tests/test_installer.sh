@@ -18,6 +18,9 @@ fake_sys() {      # fake_sys <mem_sleep line>
         "$T/sys/sys/power" "$T/sys/sys/bus/acpi/devices/INT33A1:00" "$T/sys/sys/kernel/debug/pmc_core"
     touch "$T/sys/dev/cros_fp"
     echo MrChromebox-2609.3 > "$T/sys/sys/class/dmi/id/bios_version"
+    echo Google > "$T/sys/sys/class/dmi/id/sys_vendor"
+    echo Kohaku > "$T/sys/sys/class/dmi/id/product_name"
+    echo Kohaku > "$T/sys/sys/class/dmi/id/board_name"
     python3 -c "import struct; b=bytearray(276); struct.pack_into('<I', b, 112, 1 << 21); open('$T/sys/sys/firmware/acpi/tables/FACP','wb').write(b)"
     echo "$1" > "$T/sys/sys/power/mem_sleep"
     echo 123456 > "$T/sys/sys/kernel/debug/pmc_core/slp_s0_residency_usec"
@@ -170,6 +173,36 @@ mkdir -p "$D/var/lib"; echo "not a directory" > "$D/var/lib/cros-fprintd"
 run; rc=$?
 check '[ $rc -ne 0 ] && grep -q "restoring the previous state" "$T/out"' "installer fails and rolls back"
 check '[ ! -e "$BIN" ] && [ ! -e "$UNIT" ] && [ ! -f "$T/svc/masked" ]' "no half-finished installation remains"
+
+# --- board check and override
+other_board() { echo "$1" > "$T/sys/sys/class/dmi/id/product_name"; echo "$1" > "$T/sys/sys/class/dmi/id/board_name"; }
+
+echo "== another Chromebook is refused by default"
+fake_sys "[s2idle] deep"; other_board Dratini; rm -rf "$D" "$T/svc"/*; touch "$T/svc/will_start"
+run; rc=$?
+check '[ $rc -ne 0 ] && grep -q "untested board .Google Dratini." "$T/out" && grep -q -- "--allow-untested-board" "$T/out"' \
+      "refused, naming the board and the override"
+check '[ ! -e "$BIN" ] && [ ! -f "$T/svc/masked" ]' "nothing installed"
+
+echo "== --allow-untested-board installs on it, with a warning"
+run --allow-untested-board; rc=$?
+check '[ $rc -eq 0 ] && [ -e "$BIN" ] && grep -q "\[warn\] untested board" "$T/out"' "installed with a warning"
+
+echo "== --check reports the board, with and without the override"
+FPRINTD_CHECK_ROOT="$T/sys" bash "$INSTALLER" --check </dev/null >"$T/out" 2>&1; rc=$?
+check '[ $rc -ne 0 ] && grep -q "\[FAIL\] untested board" "$T/out"' "--check fails on another board"
+FPRINTD_CHECK_ROOT="$T/sys" bash "$INSTALLER" --check --allow-untested-board </dev/null >"$T/out" 2>&1; rc=$?
+check '[ $rc -eq 0 ] && grep -q "\[warn\] untested board" "$T/out"' "--check --allow-untested-board passes with a warning"
+
+echo "== the override doesn't relax the other requirements"
+fake_sys "s2idle [deep]"; other_board Dratini; rm -rf "$D" "$T/svc"/*; touch "$T/svc/will_start"
+run --allow-untested-board; rc=$?
+check '[ $rc -ne 0 ] && [ ! -e "$BIN" ] && grep -q "deep sleep (S3) is not supported" "$T/out"' "S3 still refused"
+
+echo "== Kohaku passes, matched case-insensitively"
+fake_sys "[s2idle] deep"; other_board KOHAKU
+FPRINTD_CHECK_ROOT="$T/sys" bash "$INSTALLER" --check </dev/null >"$T/out" 2>&1; rc=$?
+check '[ $rc -eq 0 ] && grep -q "\[ok\]   board: Kohaku" "$T/out"' "KOHAKU accepted"
 
 # --- other fingerprint readers
 fake_hwdb() {
